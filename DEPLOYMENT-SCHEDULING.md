@@ -68,3 +68,28 @@ L'API `pteInstall` installe **un seul fichier `.app` par appel** — le script b
 - **`ValidateWorkflowInput@v9.2`** (repris de `Create release` par erreur au départ) ne fonctionne que pour les workflows **officiels** d'AL-Go — elle cherche un script `Validate-<nomduworkflow>.ps1` intégré dans `microsoft/AL-Go-Actions` lui-même, sans point d'extension pour un workflow personnalisé (`throw "No validate workflow script found for <nom>."`). **À retirer systématiquement** de tout nouveau workflow custom qui ne fait pas partie du set standard AL-Go — ce n'est pas indispensable (elle ne validait qu'un format de saisie, `updateVersionNumber`, qui reste de toute façon validé plus tard dans le job `UpdateVersionNumber`).
 - **`DetermineArtifactsForRelease`** (aussi repris de `Create release`) refuse de créer une release si le commit `main` actuel ne correspond pas exactement au commit du dernier build CI/CD réussi (`"The main branch has changed since the last successful build."`) — comportement standard d'AL-Go, pas un bug introduit par ce workflow. Il faut qu'une CI/CD ait réussi sur le commit exact qu'on veut publier avant de lancer ce workflow (ou activer `useGhTokenWorkflow` pour contourner).
 - L'erreur ci-dessus peut être trompeuse si l'échec réel de la CI/CD vient d'ailleurs (ex. un token `AUTHCONTEXT` expiré sur un environnement sandbox) — toujours vérifier le **dernier run CI/CD réussi** (`gh run list --workflow "CI/CD" --status success`) et comparer son `headSha` au commit `main` actuel avant de conclure que c'est un problème de ce workflow.
+
+## Workflow `Auto Release On Merge` (ajouté le 14/09/2026, ⚠️ non testé)
+
+`.github/workflows/AutoReleaseOnMerge.yaml` — déclenche automatiquement une release (et éventuellement son déploiement planifié) dès qu'une PR est mergée, sans action manuelle.
+
+### Fonctionnement
+
+- Se déclenche sur **tout** merge de PR, sur **toutes les branches** — limitation technique de GitHub : le filtre de déclenchement (`on:`) doit être statique dans le YAML, impossible d'y lire `settings.json` avant que le workflow démarre. Le vrai filtrage se fait donc **à l'intérieur** du job, en tout premier, et s'arrête (quelques secondes, négligeable) si les conditions ci-dessous ne sont pas remplies.
+- Lit `.AL-Go/settings.json` → `autoReleaseOnMerge` :
+  ```json
+  "autoReleaseOnMerge": {
+    "enabled": false,
+    "branches": [ "main" ],
+    "workflowType": "ReleaseWithDeploy"
+  }
+  ```
+  - `enabled: false` par défaut — rien ne se passe tant que ce n'est pas mis à `true` explicitement.
+  - `branches` : liste des branches de destination à surveiller (un merge vers une autre branche est ignoré).
+  - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
+- Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
+- Dérive automatiquement le tag de release depuis `app.json` (`Major.Minor.0`), via une **heuristique** : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
+
+### ⚠️ Point de vigilance majeur
+
+Une fois `enabled: true`, **chaque merge sur une branche surveillée déclenche une vraie release et potentiellement un vrai déploiement planifié en production**, sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
