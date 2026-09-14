@@ -1,12 +1,16 @@
 name: ' Auto Release On Merge'
 
-# Reacts to every merged PR, on every branch (GitHub requires this trigger filter to be static
-# YAML - it can't read settings.json before the job starts). The actual branch/enabled check
-# happens inside the job itself, driven by the "autoReleaseOnMerge" setting - see
-# DEPLOYMENT-SCHEDULING.md for details and known limitations.
+# Reacts to the CI/CD workflow completing on any branch, rather than to the PR-merge event
+# itself. This guarantees a release is only ever created from a commit that CI/CD has actually
+# built and tested successfully - reacting to "pull_request: closed" instead would race against
+# the CI/CD run that starts asynchronously right after the merge, and nothing prevents a merge
+# from happening before/without a successful CI/CD run in the first place (no required status
+# check is enforced by branch protection here). See DEPLOYMENT-SCHEDULING.md for the incident
+# this fixes, the branch-protection recommendation, and other known limitations.
 on:
-  pull_request:
-    types: [ closed ]
+  workflow_run:
+    workflows: [ 'CI/CD' ]
+    types: [ completed ]
 
 permissions:
   actions: read
@@ -14,7 +18,7 @@ permissions:
 
 jobs:
   CheckAndTriggerRelease:
-    if: github.event.pull_request.merged == true
+    if: github.event.workflow_run.conclusion == 'success'
     runs-on: windows-latest
     defaults:
       run:
@@ -23,7 +27,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
+          ref: ${{ github.event.workflow_run.head_sha }}
 
       - name: Read settings
         id: ReadSettings
@@ -34,7 +38,7 @@ jobs:
       - name: Check settings and trigger release if enabled
         env:
           GH_TOKEN: ${{ github.token }}
-          BaseRef: ${{ github.event.pull_request.base.ref }}
+          BaseRef: ${{ github.event.workflow_run.head_branch }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
@@ -48,7 +52,7 @@ jobs:
 
           $branches = @($auto.branches)
           if ($branches -notcontains $env:BaseRef) {
-              Write-Host "PR was merged into '$($env:BaseRef)', which is not in autoReleaseOnMerge.branches ($($branches -join ', ')). Nothing to do."
+              Write-Host "CI/CD succeeded on '$($env:BaseRef)', which is not in autoReleaseOnMerge.branches ($($branches -join ', ')). Nothing to do."
               exit 0
           }
 

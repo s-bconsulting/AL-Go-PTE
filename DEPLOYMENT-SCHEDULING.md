@@ -71,11 +71,29 @@ L'API `pteInstall` installe **un seul fichier `.app` par appel** — le script b
 
 ## Workflow `Auto Release On Merge` (ajouté le 14/09/2026, ⚠️ non testé)
 
-`.github/workflows/AutoReleaseOnMerge.yaml` — déclenche automatiquement une release (et éventuellement son déploiement planifié) dès qu'une PR est mergée, sans action manuelle.
+`.github/workflows/AutoReleaseOnMerge.yaml` — déclenche automatiquement une release (et éventuellement son déploiement planifié) dès que la CI/CD réussit sur une branche surveillée, sans action manuelle.
+
+### ⚠️ Pourquoi ce n'est pas déclenché directement par le merge de la PR
+
+Une première version se déclenchait sur `pull_request: types: [closed]`, c'est-à-dire **immédiatement** au moment du merge. Deux problèmes avec ça :
+
+1. **Aucune garantie que la CI/CD ait réussi** sur le commit mergé — sans règle de protection de branche exigeant ce check (voir section suivante), GitHub autorise le merge même si la CI/CD est rouge, en cours, ou n'a jamais tourné.
+2. **Effet de course** : même quand la CI/CD finit par réussir, elle démarre de façon asynchrone après le merge (déclenchée par le push sur la branche). Le workflow se déclenchant *au moment même du merge* tirait donc quasi systématiquement **avant** la fin de ce run, et `DetermineArtifactsForRelease` (dans `CreateRelease`/`CreateReleaseWithDeploy`) refusait la release avec `"The main branch has changed since the last successful build."` — pas un vrai garde-fou, juste un échec de timing.
+
+**La version actuelle se déclenche sur `workflow_run: workflows: ['CI/CD'], types: [completed]`, filtré par `if: github.event.workflow_run.conclusion == 'success'`.** Une release n'est donc jamais tentée sans qu'un run CI/CD ait explicitement réussi sur ce commit précis — que ce run vienne d'un merge de PR ou d'un push direct sur la branche.
+
+### Recommandation : protection de branche
+
+Ce workflow ne remplace pas une règle de protection de branche — il garantit qu'*une release ne parte pas* sans CI/CD verte, mais n'empêche pas en soi un merge non validé. Pour un vrai garde-fou en amont (comme configuré sur `SBLawyer-AL` → branche `master` : 1 review obligatoire, push direct restreint, force-push/suppression bloqués), il est recommandé d'activer sur la branche surveillée par `autoReleaseOnMerge` :
+
+- **Required status checks** = le workflow `CI/CD` (empêche le clic "Merge" tant qu'il n'est pas vert).
+- **Required pull request reviews** (au moins 1 approbation).
+- **Restrict who can push** (empêche un push direct qui contournerait la revue).
+
+Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource` n'a de protection sur `main` — c'est un réglage GitHub par dépôt (Settings → Branches), pas quelque chose qu'un template ou ce workflow peut propager automatiquement.
 
 ### Fonctionnement
 
-- Se déclenche sur **tout** merge de PR, sur **toutes les branches** — limitation technique de GitHub : le filtre de déclenchement (`on:`) doit être statique dans le YAML, impossible d'y lire `settings.json` avant que le workflow démarre. Le vrai filtrage se fait donc **à l'intérieur** du job, en tout premier, et s'arrête (quelques secondes, négligeable) si les conditions ci-dessous ne sont pas remplies.
 - Lit `.AL-Go/settings.json` → `autoReleaseOnMerge` :
   ```json
   "autoReleaseOnMerge": {
@@ -85,7 +103,7 @@ L'API `pteInstall` installe **un seul fichier `.app` par appel** — le script b
   }
   ```
   - `enabled: false` par défaut — rien ne se passe tant que ce n'est pas mis à `true` explicitement.
-  - `branches` : liste des branches de destination à surveiller (un merge vers une autre branche est ignoré).
+  - `branches` : liste des branches à surveiller (une CI/CD réussie sur une autre branche est ignorée).
   - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
 - Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
 - Dérive automatiquement le tag de release depuis `app.json` (`Major.Minor.0`), via une **heuristique** : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
