@@ -46,3 +46,25 @@ Le compte/l'application utilisé pour le secret `AUTHCONTEXT` de l'environnement
 ## Limite connue
 
 L'API `pteInstall` installe **un seul fichier `.app` par appel** — le script boucle sur `$parameters.Apps` si plusieurs apps PTE doivent être déployées. Les dépendances (`$parameters.Dependencies`) continuent de passer par l'ancienne Automation API (`Publish-PerTenantExtensionApps`), car la planification n'a de sens que pour l'app principale.
+
+## Workflow `Create Release With Deploy` (ajouté le 14/09/2026)
+
+`.github/workflows/CreateReleaseWithDeploy.yaml` — reprend à l'identique tous les jobs du workflow `Create release` généré par AL-Go (création de la release, upload des artefacts, branche de release, incrément de version), et ajoute deux jobs après :
+
+- **`DetermineReleaseDeployEnvironments`** : lit les settings, ne garde que les environnements dont le bloc `DeployTo<NomEnv>` a `"deployAfterRelease": true`.
+- **`DeployAfterRelease`** : déploie (via `DeployToSaaS.ps1`, **inchangé** — le filtrage se fait entièrement en amont, pas besoin d'y toucher) uniquement sur ces environnements, avec la version qui vient d'être publiée. Ne se déclenche que si `releaseType == 'Release'` (pas pour une Prerelease ou un Draft).
+
+### Activer le déploiement automatique après une release
+
+```json
+"DeployToSB_Consulting": {
+  "deploymentSchedule": "UpdateWindow",
+  "deployAfterRelease": true
+}
+```
+
+### Pièges rencontrés en le construisant
+
+- **`ValidateWorkflowInput@v9.2`** (repris de `Create release` par erreur au départ) ne fonctionne que pour les workflows **officiels** d'AL-Go — elle cherche un script `Validate-<nomduworkflow>.ps1` intégré dans `microsoft/AL-Go-Actions` lui-même, sans point d'extension pour un workflow personnalisé (`throw "No validate workflow script found for <nom>."`). **À retirer systématiquement** de tout nouveau workflow custom qui ne fait pas partie du set standard AL-Go — ce n'est pas indispensable (elle ne validait qu'un format de saisie, `updateVersionNumber`, qui reste de toute façon validé plus tard dans le job `UpdateVersionNumber`).
+- **`DetermineArtifactsForRelease`** (aussi repris de `Create release`) refuse de créer une release si le commit `main` actuel ne correspond pas exactement au commit du dernier build CI/CD réussi (`"The main branch has changed since the last successful build."`) — comportement standard d'AL-Go, pas un bug introduit par ce workflow. Il faut qu'une CI/CD ait réussi sur le commit exact qu'on veut publier avant de lancer ce workflow (ou activer `useGhTokenWorkflow` pour contourner).
+- L'erreur ci-dessus peut être trompeuse si l'échec réel de la CI/CD vient d'ailleurs (ex. un token `AUTHCONTEXT` expiré sur un environnement sandbox) — toujours vérifier le **dernier run CI/CD réussi** (`gh run list --workflow "CI/CD" --status success`) et comparer son `headSha` au commit `main` actuel avant de conclure que c'est un problème de ce workflow.
