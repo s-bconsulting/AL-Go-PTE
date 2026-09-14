@@ -24,6 +24,13 @@
 
 .PARAMETER reuseExistingEnvironment
     $true to reuse an existing environment with the same name, $false to recreate it. Prompted for if not specified.
+    When -sourceEnvironment is also specified, $false means "replace it with a fresh copy of sourceEnvironment"
+    and $true means "keep whatever is already there, skip the copy".
+
+.PARAMETER sourceEnvironment
+    Optional. Name of an existing PRODUCTION environment (on the same client tenant) to copy, instead of
+    creating a blank sandbox. Uses Copy-BcEnvironment (data + installed apps are copied from the source).
+    Your app(s) are still published on top afterwards, same as a normal run.
 
 .PARAMETER fromVSCode
     Pauses at the end waiting for ENTER, for use as a VS Code task.
@@ -36,6 +43,9 @@
 
 .EXAMPLE
     .\.AL-Go\cloudDevEnvForClientTenant.ps1 -clientTenantId "15806119-3504-4617-a150-ddb832593ec6" -environmentName "contoso-dev"
+
+.EXAMPLE
+    .\.AL-Go\cloudDevEnvForClientTenant.ps1 -clientTenantId "15806119-3504-4617-a150-ddb832593ec6" -environmentName "contoso-dev" -sourceEnvironment "Production" -reuseExistingEnvironment $false
 #>
 
 Param(
@@ -43,6 +53,7 @@ Param(
     [string] $clientTenantId,
     [string] $environmentName = "",
     [bool] $reuseExistingEnvironment,
+    [string] $sourceEnvironment = "",
     [switch] $fromVSCode,
     [switch] $clean,
     [string] $customSettings = ""
@@ -150,12 +161,35 @@ if (-not $environmentName) {
         -trimCharacters @('"',"'",' ')
 }
 
+if ($PSBoundParameters.Keys -notcontains 'sourceEnvironment') {
+    $createFromCopy = (Select-Value `
+        -title "How should this environment be created?" `
+        -options @{ "Blank" = "Create a new, empty sandbox"; "Copy" = "Copy an existing production environment" } `
+        -question "Select creation mode" `
+        -default "Blank") -eq "Copy"
+    if ($createFromCopy) {
+        $sourceEnvironment = Enter-Value `
+            -title "Source production environment" `
+            -question "Please enter the name of the production environment to copy" `
+            -trimCharacters @('"',"'",' ')
+    }
+}
+
 if ($PSBoundParameters.Keys -notcontains 'reuseExistingEnvironment') {
-    $reuseExistingEnvironment = (Select-Value `
-        -title "What if the environment already exists?" `
-        -options @{ "Yes" = "Reuse existing environment"; "No" = "Recreate environment" } `
-        -question "Select behavior" `
-        -default "No") -eq "Yes"
+    if ($sourceEnvironment) {
+        $reuseExistingEnvironment = (Select-Value `
+            -title "What if the environment already exists?" `
+            -options @{ "Yes" = "Keep it as-is (skip the copy)"; "No" = "Replace it with a fresh copy of $sourceEnvironment" } `
+            -question "Select behavior" `
+            -default "No") -eq "Yes"
+    }
+    else {
+        $reuseExistingEnvironment = (Select-Value `
+            -title "What if the environment already exists?" `
+            -options @{ "Yes" = "Reuse existing environment"; "No" = "Recreate environment" } `
+            -question "Select behavior" `
+            -default "No") -eq "Yes"
+    }
 }
 
 DownloadAndImportBcContainerHelper -baseFolder $baseFolder
@@ -176,12 +210,33 @@ else {
     (ConvertTo-SecureString $bcAuthContext.RefreshToken -AsPlainText -Force) | Export-Clixml $secretFile
 }
 
+$createDevEnvReuseExisting = $reuseExistingEnvironment
+
+if ($sourceEnvironment) {
+    if ($reuseExistingEnvironment) {
+        Write-Host "Keeping existing environment '$environmentName' as-is (not copying from '$sourceEnvironment')"
+    }
+    else {
+        Write-Host "Copying production environment '$sourceEnvironment' to '$environmentName'..."
+        Copy-BcEnvironment `
+            -bcAuthContext $bcAuthContext `
+            -environment $environmentName `
+            -sourceEnvironment $sourceEnvironment `
+            -environmentType Sandbox `
+            -force
+        Write-Host -ForegroundColor Green "Copy of '$sourceEnvironment' into '$environmentName' completed"
+    }
+    # The environment now definitely exists (freshly copied, or kept as-is above) - tell CreateDevEnv
+    # to reuse it rather than trying to create a blank one, regardless of what was asked/passed above.
+    $createDevEnvReuseExisting = $true
+}
+
 CreateDevEnv `
     -kind cloud `
     -caller local `
     -bcAuthContext $bcAuthContext `
     -environmentName $environmentName `
-    -reuseExistingEnvironment:$reuseExistingEnvironment `
+    -reuseExistingEnvironment:$createDevEnvReuseExisting `
     -baseFolder $baseFolder `
     -project $project `
     -clean:$clean `
