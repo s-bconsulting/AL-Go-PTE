@@ -139,9 +139,14 @@ Le workflow bascule donc l'incrément de version sur la branche **source** de la
 - L'incrément se fait en `directCommit: true` (commit direct sur la branche de développement, pas de PR à valider en plus) — à changer directement dans le workflow si vous préférez une PR ici aussi.
 - **`versioningStrategy: 3` est obligatoire** (ajouté dans `.AL-Go/settings.json`) — confirmé en lisant le code source de `microsoft/AL-Go-Actions/IncrementVersionNumber@v9.2` (`IncrementVersionNumber.ps1`) : l'incrément `+0.0.1` n'est autorisé que si `($settings.versioningStrategy -band 15) -eq 3`, sinon l'action échoue avec `"Incremental version number +0.0.1 is not allowed. Allowed incremental version numbers are: +1, +0.1"`. Sans ce réglage, ni cette fonctionnalité ni la suivante ne peuvent fonctionner avec le défaut `+0.0.1`.
 
-## Workflow `Auto Increment On CICD` (ajouté le 15/09/2026, ⚠️ non testé)
+## Workflow `Auto Increment On CICD` (ajouté le 15/09/2026, ✅ validé en conditions réelles sur ALGOPTESample le 15/09/2026 — les deux bugs ci-dessous ont été trouvés et corrigés grâce à ce test)
 
 `.github/workflows/AutoIncrementOnCICD.yaml` — fait avancer automatiquement `app.json` sur la branche de développement à **chaque** réussite de CI/CD, indépendamment de toute release. Complète `Auto Release On Merge` (qui ne bump la branche de dev qu'une seule fois, juste après une release) par un incrément continu au fil du développement.
+
+### Bugs trouvés et corrigés lors du test réel
+
+- **Crash sous `Set-StrictMode -Version 2.0`** quand `autoIncrementOnCICD` (ou `autoReleaseOnMerge`) est totalement absent du `settings.json` de la branche testée — chaque branche a sa propre copie de ce fichier, rien ne la synchronise automatiquement avec `main`. Référencer une propriété totalement absente via la notation pointée (`$settings.autoIncrementOnCICD`) est une erreur sous Strict Mode, pas juste `$null`. Corrigé dans les deux workflows via `$settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty <nom>`.
+- **`HTTP 403: Resource not accessible by integration`** sur `gh workflow run IncrementVersionNumber.yaml` — l'endpoint de déclenchement d'un `workflow_dispatch` exige `actions: write`, alors que les deux workflows (`AutoIncrementOnCICD.yaml` et `AutoReleaseOnMerge.yaml`) ne déclaraient que `actions: read`. Le réglage par défaut du repo (`default_workflow_permissions: "read"`, vérifié via l'API) ne suffit pas non plus — il faut le déclarer explicitement dans le `permissions:` de chaque workflow qui appelle `gh workflow run`.
 
 ### Fonctionnement
 
@@ -159,17 +164,13 @@ Le workflow bascule donc l'incrément de version sur la branche **source** de la
   - `versionIncrement` : même valeur/rôle que sur `Auto Release On Merge`, défaut `"+0.0.1"`.
 - **`CICD.yaml` doit déclencher `push` sur cette branche** pour que ce workflow ait quoi que ce soit à réagir — `develop` a été ajoutée à `on.push.branches` dans `CICD.yaml` en conséquence (à ajuster si votre branche a un autre nom).
 
-### ⚠️ Risque de boucle infinie — comment il est évité
+### Risque de boucle infinie — deux garde-fous, un seul réellement sollicité en pratique
 
-Ce workflow, à chaque incrément réussi, fait un commit direct (`directCommit: true`) sur la branche surveillée — et `CICD.yaml` déclenche `push` sur cette même branche, sans exclure `app.json` de son `paths-ignore`. Sans protection, ce commit **redéclenche la CI/CD**, qui en réussissant redéclenche un nouvel incrément, indéfiniment.
+Ce workflow, à chaque incrément réussi, fait un commit direct (`directCommit: true`) sur la branche surveillée — et `CICD.yaml` déclenche `push` sur cette même branche, sans exclure `app.json` de son `paths-ignore`. En théorie, ce commit pourrait **redéclencher la CI/CD**, qui en réussissant redéclencherait un nouvel incrément, indéfiniment.
 
-En lisant le code source de l'action (`IncrementVersionNumber.ps1`, v9.2), le message de commit qu'elle produit est **toujours** l'un des deux suivants, sans aucun marqueur `[skip ci]` :
-- `"Incremented Version number by <valeur>"` (incrément relatif, ex. `+0.0.1`)
-- `"New Version number <valeur>"` (valeur absolue)
+**Confirmé en conditions réelles (15/09/2026) : ça n'arrive pas**, parce que le commit d'incrément est poussé avec le `GITHUB_TOKEN` par défaut (aucun `useGhTokenWorkflow: true` n'est passé lors du déclenchement d'`IncrementVersionNumber.yaml`), et GitHub a une règle explicite : **un push effectué avec le `GITHUB_TOKEN` ne déclenche jamais de workflow `on: push`**, précisément pour éviter ce genre de boucle — vérifié : aucun run `CI/CD` n'a été créé pour ce commit. La boucle est donc coupée par GitHub lui-même, avant même d'atteindre notre propre garde-fou.
 
-Le job vérifie donc `github.event.workflow_run.head_commit.message` et **s'arrête sans rien faire** si ce message correspond à l'un de ces deux formats — évite la boucle sans avoir à modifier l'action Microsoft elle-même.
-
-**⚠️ Non testé en conditions réelles** — comme le reste de cette série de workflows. Le garde-fou anti-boucle repose sur un texte de commit observé dans le code source actuel (v9.2) de l'action Microsoft ; à revalider si vous montez de version d'AL-Go.
+Le garde-fou applicatif (vérifier `github.event.workflow_run.head_commit.message` contre `"Incremented Version number by <valeur>"` / `"New Version number <valeur>"`, le texte exact produit par `IncrementVersionNumber.ps1` v9.2) reste en place en défense en profondeur — utile si vous passez un jour `useGhTokenWorkflow: true` (pour que le commit d'incrément soit lui-même validé par une CI/CD, ce qui utiliserait le PAT `GHTOKENWORKFLOW` et redéclencherait bien un run) — mais dans la configuration par défaut, il ne sera jamais sollicité.
 
 ### ⚠️ Point de vigilance majeur
 
