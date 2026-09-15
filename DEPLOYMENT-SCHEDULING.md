@@ -71,11 +71,30 @@ L'API `pteInstall` installe **un seul fichier `.app` par appel** — le script b
 
 ## Workflow `Auto Release On Merge` (ajouté le 14/09/2026, ⚠️ non testé)
 
-`.github/workflows/AutoReleaseOnMerge.yaml` — déclenche automatiquement une release (et éventuellement son déploiement planifié) dès qu'une PR est mergée, sans action manuelle.
+`.github/workflows/AutoReleaseOnMerge.yaml` — déclenche automatiquement une release (et éventuellement son déploiement planifié) dès qu'une PR est mergée dans une branche surveillée, sans action manuelle.
+
+### ⚠️ Pourquoi il attend la CI/CD avant de déclencher, sans pour autant réagir à "n'importe quelle CI/CD"
+
+Le déclencheur reste volontairement `pull_request: types: [closed]` (un vrai merge de PR, sur une branche choisie) — **pas** `workflow_run` sur la réussite de la CI/CD en général. Réagir à n'importe quel run CI/CD réussi aurait aussi déclenché des releases sur le **run planifié nocturne** (`schedule`/cron, que `CI/CD.yaml` d'AL-Go inclut généralement) ou un `workflow_dispatch` manuel, sans qu'aucun merge n'ait eu lieu — bien plus large que ce qu'on veut.
+
+Le problème restait cependant réel : réagir *immédiatement* au merge tirait quasi systématiquement **avant** la fin du run CI/CD que ce même merge déclenche de façon asynchrone (via le push sur la branche), et `DetermineArtifactsForRelease` (dans `CreateRelease`/`CreateReleaseWithDeploy`) refusait alors la release avec `"The main branch has changed since the last successful build."` — pas un vrai garde-fou, juste un échec de timing.
+
+**La version actuelle résout ça sans changer le déclencheur** : une fois le merge confirmé éligible (`enabled` + branche surveillée), le job **attend** (poll toutes les 30s, jusqu'à 90 minutes) qu'un run `CI/CD` correspondant **exactement** au commit de merge (`merge_commit_sha`) se termine, puis vérifie que sa conclusion est `success` avant de déclencher la release. Si la CI/CD échoue ou n'a pas terminé dans le délai, le workflow s'arrête en erreur et **aucune release n'est créée**.
+
+Contrepartie : le job reste actif (sur un runner GitHub hébergé `windows-latest`) pendant toute cette attente, ce qui consomme des minutes facturées le temps que la CI/CD tourne. À surveiller si `autoReleaseOnMerge` est activé sur un repo où la CI/CD est longue ou fréquente ; faire tourner ce job sur le runner self-hosted serait une option si le coût devient significatif.
+
+### Recommandation complémentaire : protection de branche
+
+Ce workflow garantit qu'*une release ne parte pas* sans CI/CD verte sur le commit mergé, mais n'empêche pas en soi un merge non validé (rien n'oblige la CI/CD à être verte pour que le bouton "Merge" soit cliquable). Pour un vrai garde-fou en amont (comme configuré sur `SBLawyer-AL` → branche `master` : 1 review obligatoire, push direct restreint, force-push/suppression bloqués), il est recommandé d'activer sur la branche surveillée par `autoReleaseOnMerge` :
+
+- **Required status checks** = le workflow `CI/CD` (empêche le clic "Merge" tant qu'il n'est pas vert).
+- **Required pull request reviews** (au moins 1 approbation).
+- **Restrict who can push** (empêche un push direct qui contournerait la revue).
+
+Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource` n'a de protection sur `main` — c'est un réglage GitHub par dépôt (Settings → Branches), pas quelque chose qu'un template ou ce workflow peut propager automatiquement.
 
 ### Fonctionnement
 
-- Se déclenche sur **tout** merge de PR, sur **toutes les branches** — limitation technique de GitHub : le filtre de déclenchement (`on:`) doit être statique dans le YAML, impossible d'y lire `settings.json` avant que le workflow démarre. Le vrai filtrage se fait donc **à l'intérieur** du job, en tout premier, et s'arrête (quelques secondes, négligeable) si les conditions ci-dessous ne sont pas remplies.
 - Lit `.AL-Go/settings.json` → `autoReleaseOnMerge` :
   ```json
   "autoReleaseOnMerge": {
