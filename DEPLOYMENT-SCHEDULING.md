@@ -100,12 +100,14 @@ Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource`
   "autoReleaseOnMerge": {
     "enabled": false,
     "branches": [ "main" ],
-    "workflowType": "ReleaseWithDeploy"
+    "workflowType": "ReleaseWithDeploy",
+    "versionIncrement": "+0.0.1"
   }
   ```
   - `enabled: false` par défaut — rien ne se passe tant que ce n'est pas mis à `true` explicitement.
   - `branches` : liste des branches de destination à surveiller (un merge vers une autre branche est ignoré).
   - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
+  - `versionIncrement` : valeur passée à `IncrementVersionNumber` sur la branche de développement après la release (voir section suivante) — défaut `"+0.0.1"` si absent.
 - Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
 - Dérive le tag de release depuis `app.json`, **verbatim, les 4 segments tels quels** (ex. `10.4.3.280`) — pas de recomposition en 3 segments. Heuristique de recherche : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
 - Si un tag portant cette version existe déjà (le merge n'a pas fait bouger `app.json`), le workflow s'arrête sans rien faire plutôt que d'échouer sur un tag dupliqué.
@@ -124,6 +126,18 @@ Contrairement à un simple compteur de build, chez SB Consulting chaque segment 
 Conséquence directe : `app.json.version` doit être bumpé **par la PR elle-même** (politique d'équipe) avant un merge qui doit déclencher une release — `AutoReleaseOnMerge` ne le fait jamais à la place de vous. C'est déjà la convention manuelle utilisée sur `SBLawyer-AL` (où `app.json` sur `main` correspond toujours exactement au tag de la dernière release) ; ce workflow ne fait que l'automatiser une fois la convention respectée en amont.
 
 **⚠️ Non vérifié en pratique** : le tag est transmis tel quel à l'API GitHub de création de release (`createRelease`, aucun parsing semver à cette étape), donc un tag à 4 segments devrait fonctionner sans souci — mais si `CreateReleaseNotes` (génération du changelog) compare des tags entre eux, un comportement avec des tags à 4 segments n'a pas encore été observé en conditions réelles. À surveiller au premier run.
+
+### Incrément de version après la release — sur la branche de développement, jamais sur `main`
+
+`main` reste volontairement figé à la version qui vient d'être publiée — c'est ce qui permet à `app.json` et au tag de release de rester identiques (voir tableau ci-dessus). Mais l'équipe veut quand même que la prochaine version cible soit déjà en place pour la suite du développement, **sans y toucher sur `main`**.
+
+Le workflow bascule donc l'incrément de version sur la branche **source** de la PR qui vient d'être mergée (`github.event.pull_request.head.ref`) — la branche de développement persistante (ex. `develop`), sur laquelle les développeurs continuent de merger leurs propres branches avant qu'elle ne soit à son tour mergée dans `main` pour déclencher une release.
+
+- Valeur appliquée : `autoReleaseOnMerge.versionIncrement` (défaut `"+0.0.1"` si absent) — avance uniquement le 3ᵉ segment (Mineur/Fix), laisse Majeur/CU/marqueur BC intacts. Passé tel quel à l'action `IncrementVersionNumber` du workflow `IncrementVersionNumber.yaml` (inchangé, standard AL-Go), déclenché avec `--ref` sur cette branche.
+- **Ne bloque jamais la release** : les deux déclenchements (`Create release`/`Create Release With Deploy`, puis `IncrementVersionNumber`) sont deux runs Actions indépendants — un souci sur le second n'affecte pas le premier.
+- **Garde-fou** : si la branche de développement n'existe plus (cas exceptionnel — elle est censée être persistante, jamais supprimée après un merge), le workflow log un avertissement (`::warning::`) et n'essaie pas de déclencher `IncrementVersionNumber` sur une branche inexistante ; l'incrément est alors à faire manuellement.
+- L'incrément se fait en `directCommit: true` (commit direct sur la branche de développement, pas de PR à valider en plus) — à changer directement dans le workflow si vous préférez une PR ici aussi.
+- **⚠️ Non vérifié en pratique**, comme le reste de ce workflow — `versioningStrategy` peut nécessiter un réglage spécifique pour qu'AL-Go accepte de piloter le 3ᵉ segment (Build) sans toucher au 4ᵉ (Revision) ; à confirmer au premier run réel.
 
 ### ⚠️ Point de vigilance majeur
 

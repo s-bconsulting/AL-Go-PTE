@@ -11,6 +11,7 @@
   "autoReleaseOnMerge": {
     "enabled": false,
     "branches": [ "main" ],
-    "workflowType": "ReleaseWithDeploy"
+    "workflowType": "ReleaseWithDeploy",
+    "versionIncrement": "+0.0.1"
   }
 }

@@ -42,7 +42,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BaseRef: ${{ github.event.pull_request.base.ref }}
+          HeadRef: ${{ github.event.pull_request.head.ref }}
           MergeSha: ${{ github.event.pull_request.merge_commit_sha }}
+          Repository: ${{ github.repository }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
@@ -133,3 +135,21 @@ jobs:
               -f name="Release $tag" `
               -f tag=$tag `
               -f releaseType=Release
+
+          # app.json on $BaseRef (main) stays frozen at the version that was just released - it
+          # must never be bumped here. Instead, bump the version on the branch this PR came FROM
+          # (the persistent development branch, e.g. "develop"), so ongoing work already targets
+          # the next version. Controlled by autoReleaseOnMerge.versionIncrement, defaulting to
+          # "+0.0.1" (advances the build/fix segment only) if not set. See DEPLOYMENT-SCHEDULING.md.
+          $versionIncrement = if ($auto.versionIncrement) { $auto.versionIncrement } else { '+0.0.1' }
+
+          gh api "repos/$($env:Repository)/branches/$($env:HeadRef)" 1>$null 2>$null
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::Development branch '$($env:HeadRef)' no longer exists (deleted on merge?) - skipping automatic version increment. Bump it manually if needed."
+          } else {
+              Write-Host "Incrementing version by '$versionIncrement' on development branch '$($env:HeadRef)'"
+              gh workflow run IncrementVersionNumber.yaml `
+                  --ref $env:HeadRef `
+                  -f versionNumber=$versionIncrement `
+                  -f directCommit=true
+          }
