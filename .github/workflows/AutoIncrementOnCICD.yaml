@@ -14,7 +14,9 @@ on:
     types: [ completed ]
 
 permissions:
-  actions: read
+  # actions: write is required by "gh workflow run" (creating a workflow_dispatch event) -
+  # confirmed via a real 403 "Resource not accessible by integration" with actions: read alone.
+  actions: write
   contents: read
 
 jobs:

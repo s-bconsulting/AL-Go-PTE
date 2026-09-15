@@ -16,7 +16,10 @@ on:
     types: [ closed ]
 
 permissions:
-  actions: read
+  # actions: write is required by "gh workflow run" (creating a workflow_dispatch event) -
+  # confirmed via a real 403 "Resource not accessible by integration" on AutoIncrementOnCICD.yaml
+  # with actions: read alone; both workflows dispatch other workflows the same way.
+  actions: write
   contents: read
 
 jobs:
