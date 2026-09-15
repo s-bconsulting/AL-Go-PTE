@@ -107,7 +107,23 @@ Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource`
   - `branches` : liste des branches de destination à surveiller (un merge vers une autre branche est ignoré).
   - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
 - Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
-- Dérive automatiquement le tag de release depuis `app.json` (`Major.Minor.0`), via une **heuristique** : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
+- Dérive le tag de release depuis `app.json`, **verbatim, les 4 segments tels quels** (ex. `10.4.3.280`) — pas de recomposition en 3 segments. Heuristique de recherche : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
+- Si un tag portant cette version existe déjà (le merge n'a pas fait bouger `app.json`), le workflow s'arrête sans rien faire plutôt que d'échouer sur un tag dupliqué.
+
+### Convention de version chez SB Consulting
+
+Contrairement à un simple compteur de build, chez SB Consulting chaque segment de `app.json.version` porte un sens précis, décidé manuellement — ni AL-Go, ni ce workflow ne doivent le recalculer automatiquement :
+
+| Segment | Rôle |
+|---|---|
+| 1 (Majeur) | Version majeure du produit SB Consulting lui-même (indépendante du cycle de Microsoft — un produit plus récent que BC n'a pas à démarrer à une version aussi haute que BC). |
+| 2 (CU) | Cumulative Update du produit. |
+| 3 (Mineur/Fix) | Fait aussi office de compteur de build — chaque correctif publié l'incrémente. |
+| 4 (marqueur BC) | **Pas un numéro de build** — fixé manuellement, encode la version de Business Central visée (ex. `280` = BC 28 CU 0). Ne change que lors d'un portage vers une nouvelle version de BC, jamais à chaque release. |
+
+Conséquence directe : `app.json.version` doit être bumpé **par la PR elle-même** (politique d'équipe) avant un merge qui doit déclencher une release — `AutoReleaseOnMerge` ne le fait jamais à la place de vous. C'est déjà la convention manuelle utilisée sur `SBLawyer-AL` (où `app.json` sur `main` correspond toujours exactement au tag de la dernière release) ; ce workflow ne fait que l'automatiser une fois la convention respectée en amont.
+
+**⚠️ Non vérifié en pratique** : le tag est transmis tel quel à l'API GitHub de création de release (`createRelease`, aucun parsing semver à cette étape), donc un tag à 4 segments devrait fonctionner sans souci — mais si `CreateReleaseNotes` (génération du changelog) compare des tags entre eux, un comportement avec des tags à 4 segments n'a pas encore été observé en conditions réelles. À surveiller au premier run.
 
 ### ⚠️ Point de vigilance majeur
 

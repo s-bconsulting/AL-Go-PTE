@@ -91,7 +91,11 @@ jobs:
           }
           Write-Host "CI/CD run $($run.databaseId) succeeded on merge commit $($env:MergeSha). Proceeding."
 
-          # Derive the release tag from the main app's version in app.json.
+          # Derive the release tag from the main app's version in app.json, verbatim (all 4
+          # segments, unchanged) - do NOT collapse it to a 3-segment "Major.Minor.0" shape.
+          # Unlike a generic build/revision counter, every segment here can carry real meaning
+          # (e.g. a product major/CU/fix scheme plus a manually-set BC-compatibility marker) -
+          # rewriting the version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
           # Heuristic: first app.json found, excluding folders that look like test/performance apps.
           # If your repo layout doesn't match this assumption, adjust this section.
           $appJsonFile = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
@@ -103,9 +107,22 @@ jobs:
           }
 
           $appJson = Get-Content $appJsonFile.FullName -Raw | ConvertFrom-Json
-          $version = [System.Version]$appJson.version
-          $tag = "$($version.Major).$($version.Minor).0"
+          try {
+              [void][System.Version]$appJson.version
+          } catch {
+              throw "app.json version '$($appJson.version)' in $($appJsonFile.FullName) is not a valid version string."
+          }
+          $tag = $appJson.version
           Write-Host "Derived tag '$tag' from $($appJsonFile.FullName)"
+
+          # If app.json's version hasn't changed since the last release, this merge didn't bump
+          # it (e.g. no version-bump policy was applied in the PR) - skip rather than fail on a
+          # duplicate tag.
+          gh release view $tag --json tagName 1>$null 2>$null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "A release tagged '$tag' already exists - app.json version wasn't bumped since the last release. Nothing to do."
+              exit 0
+          }
 
           $workflowFile = if ($auto.workflowType -eq 'ReleaseWithDeploy') { 'CreateReleaseWithDeploy.yaml' } else { 'CreateRelease.yaml' }
 
