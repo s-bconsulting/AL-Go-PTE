@@ -137,8 +137,40 @@ Le workflow bascule donc l'incrément de version sur la branche **source** de la
 - **Ne bloque jamais la release** : les deux déclenchements (`Create release`/`Create Release With Deploy`, puis `IncrementVersionNumber`) sont deux runs Actions indépendants — un souci sur le second n'affecte pas le premier.
 - **Garde-fou** : si la branche de développement n'existe plus (cas exceptionnel — elle est censée être persistante, jamais supprimée après un merge), le workflow log un avertissement (`::warning::`) et n'essaie pas de déclencher `IncrementVersionNumber` sur une branche inexistante ; l'incrément est alors à faire manuellement.
 - L'incrément se fait en `directCommit: true` (commit direct sur la branche de développement, pas de PR à valider en plus) — à changer directement dans le workflow si vous préférez une PR ici aussi.
-- **⚠️ Non vérifié en pratique**, comme le reste de ce workflow — `versioningStrategy` peut nécessiter un réglage spécifique pour qu'AL-Go accepte de piloter le 3ᵉ segment (Build) sans toucher au 4ᵉ (Revision) ; à confirmer au premier run réel.
+- **`versioningStrategy: 3` est obligatoire** (ajouté dans `.AL-Go/settings.json`) — confirmé en lisant le code source de `microsoft/AL-Go-Actions/IncrementVersionNumber@v9.2` (`IncrementVersionNumber.ps1`) : l'incrément `+0.0.1` n'est autorisé que si `($settings.versioningStrategy -band 15) -eq 3`, sinon l'action échoue avec `"Incremental version number +0.0.1 is not allowed. Allowed incremental version numbers are: +1, +0.1"`. Sans ce réglage, ni cette fonctionnalité ni la suivante ne peuvent fonctionner avec le défaut `+0.0.1`.
+
+## Workflow `Auto Increment On CICD` (ajouté le 15/09/2026, ⚠️ non testé)
+
+`.github/workflows/AutoIncrementOnCICD.yaml` — fait avancer automatiquement `app.json` sur la branche de développement à **chaque** réussite de CI/CD, indépendamment de toute release. Complète `Auto Release On Merge` (qui ne bump la branche de dev qu'une seule fois, juste après une release) par un incrément continu au fil du développement.
+
+### Fonctionnement
+
+- Se déclenche sur `workflow_run: workflows: ['CI/CD'], types: [completed]`, filtré par `if: conclusion == 'success'` — volontairement pas de filtre statique par branche ici (`CICD.yaml` s'en occupe déjà via son propre `on.push.branches`), le filtrage par branche pour l'incrément se fait à l'intérieur du job.
+- Lit `.AL-Go/settings.json` → `autoIncrementOnCICD` :
+  ```json
+  "autoIncrementOnCICD": {
+    "enabled": false,
+    "branches": [ "develop" ],
+    "versionIncrement": "+0.0.1"
+  }
+  ```
+  - `enabled: false` par défaut.
+  - `branches` : **volontairement une liste précise, pas "toutes les branches"** — sur une branche perso de développeur, chacune bumperait son propre `app.json` indépendamment, garantissant des conflits à la fusion. `"develop"` est un nom générique par défaut, **à adapter au nom réel de votre branche de développement partagée**.
+  - `versionIncrement` : même valeur/rôle que sur `Auto Release On Merge`, défaut `"+0.0.1"`.
+- **`CICD.yaml` doit déclencher `push` sur cette branche** pour que ce workflow ait quoi que ce soit à réagir — `develop` a été ajoutée à `on.push.branches` dans `CICD.yaml` en conséquence (à ajuster si votre branche a un autre nom).
+
+### ⚠️ Risque de boucle infinie — comment il est évité
+
+Ce workflow, à chaque incrément réussi, fait un commit direct (`directCommit: true`) sur la branche surveillée — et `CICD.yaml` déclenche `push` sur cette même branche, sans exclure `app.json` de son `paths-ignore`. Sans protection, ce commit **redéclenche la CI/CD**, qui en réussissant redéclenche un nouvel incrément, indéfiniment.
+
+En lisant le code source de l'action (`IncrementVersionNumber.ps1`, v9.2), le message de commit qu'elle produit est **toujours** l'un des deux suivants, sans aucun marqueur `[skip ci]` :
+- `"Incremented Version number by <valeur>"` (incrément relatif, ex. `+0.0.1`)
+- `"New Version number <valeur>"` (valeur absolue)
+
+Le job vérifie donc `github.event.workflow_run.head_commit.message` et **s'arrête sans rien faire** si ce message correspond à l'un de ces deux formats — évite la boucle sans avoir à modifier l'action Microsoft elle-même.
+
+**⚠️ Non testé en conditions réelles** — comme le reste de cette série de workflows. Le garde-fou anti-boucle repose sur un texte de commit observé dans le code source actuel (v9.2) de l'action Microsoft ; à revalider si vous montez de version d'AL-Go.
 
 ### ⚠️ Point de vigilance majeur
 
-Une fois `enabled: true`, **chaque merge sur une branche surveillée déclenche une vraie release et potentiellement un vrai déploiement planifié en production**, sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
+Une fois `enabled: true` (sur `Auto Release On Merge` et/ou `Auto Increment On CICD`), des commits/releases/déploiements automatiques peuvent se produire sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.

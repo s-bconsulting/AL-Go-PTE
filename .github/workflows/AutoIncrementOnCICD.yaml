@@ -1,0 +1,81 @@
+name: ' Auto Increment On CICD'
+
+# Reacts to CI/CD succeeding, to keep the development branch's version moving forward
+# automatically as work lands on it - independent of AutoReleaseOnMerge.yaml, which only bumps
+# the dev branch once, right after a release is cut from main. See DEPLOYMENT-SCHEDULING.md.
+#
+# Deliberately NOT scoped by a static "on: push: branches:" filter here - CI/CD itself already
+# does that scoping (CICD.yaml's own branches list), and this workflow only needs to react to
+# CI/CD completing, on whichever branch that happened to be. The enabled/branch check (against
+# the "autoIncrementOnCICD" setting) happens inside the job.
+on:
+  workflow_run:
+    workflows: [ 'CI/CD' ]
+    types: [ completed ]
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  CheckAndTriggerIncrement:
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: powershell
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Read settings
+        id: ReadSettings
+        uses: microsoft/AL-Go-Actions/ReadSettings@v9.2
+        with:
+          shell: powershell
+
+      - name: Check settings and trigger increment if enabled
+        env:
+          GH_TOKEN: ${{ github.token }}
+          HeadBranch: ${{ github.event.workflow_run.head_branch }}
+          # workflow_run's head_commit.message is the exact commit message of the run's HEAD.
+          # AL-Go-Actions/IncrementVersionNumber always commits as either
+          # "Incremented Version number by <value>" (incremental) or "New Version number <value>"
+          # (absolute) - confirmed from its source (IncrementVersionNumber.ps1, v9.2). Matching on
+          # this is how the loop below is broken, since neither AL-Go nor this workflow otherwise
+          # marks that commit as [skip ci] before pushing it.
+          CommitMessage: ${{ github.event.workflow_run.head_commit.message }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $settings = $env:Settings | ConvertFrom-Json
+          $auto = $settings.autoIncrementOnCICD
+
+          if (-not $auto -or -not $auto.enabled) {
+              Write-Host "autoIncrementOnCICD is not enabled (or not configured), nothing to do."
+              exit 0
+          }
+
+          $branches = @($auto.branches)
+          if ($branches -notcontains $env:HeadBranch) {
+              Write-Host "CI/CD succeeded on '$($env:HeadBranch)', which is not in autoIncrementOnCICD.branches ($($branches -join ', ')). Nothing to do."
+              exit 0
+          }
+
+          # Loop guard: this CI/CD run's own head commit might be the increment commit from a
+          # PREVIOUS run of this same workflow - if so, incrementing again would trigger CI/CD
+          # again, which would trigger another increment, forever. Skip in that case.
+          if ($env:CommitMessage -match '^(Incremented Version number by |New Version number )') {
+              Write-Host "Head commit ('$($env:CommitMessage)') is itself a version-increment commit - skipping to avoid an increment loop."
+              exit 0
+          }
+
+          $versionIncrement = if ($auto.versionIncrement) { $auto.versionIncrement } else { '+0.0.1' }
+
+          Write-Host "Incrementing version by '$versionIncrement' on '$($env:HeadBranch)'"
+          gh workflow run IncrementVersionNumber.yaml `
+              --ref $env:HeadBranch `
+              -f versionNumber=$versionIncrement `
+              -f directCommit=true

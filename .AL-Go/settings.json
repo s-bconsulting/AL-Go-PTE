@@ -4,6 +4,7 @@
   "appFolders": [],
   "testFolders": [],
   "bcptTestFolders": [],
+  "versioningStrategy": 3,
   "DeployTo<EnvironmentName>": {
     "deploymentSchedule": "Immediate",
     "deployAfterRelease": false
@@ -12,6 +13,11 @@
     "enabled": false,
     "branches": [ "main" ],
     "workflowType": "ReleaseWithDeploy",
+    "versionIncrement": "+0.0.1"
+  },
+  "autoIncrementOnCICD": {
+    "enabled": false,
+    "branches": [ "develop" ],
     "versionIncrement": "+0.0.1"
   }
 }
