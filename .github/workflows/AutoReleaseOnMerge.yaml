@@ -1,16 +1,19 @@
 name: ' Auto Release On Merge'
 
-# Reacts to the CI/CD workflow completing on any branch, rather than to the PR-merge event
-# itself. This guarantees a release is only ever created from a commit that CI/CD has actually
-# built and tested successfully - reacting to "pull_request: closed" instead would race against
-# the CI/CD run that starts asynchronously right after the merge, and nothing prevents a merge
-# from happening before/without a successful CI/CD run in the first place (no required status
-# check is enforced by branch protection here). See DEPLOYMENT-SCHEDULING.md for the incident
-# this fixes, the branch-protection recommendation, and other known limitations.
+# Reacts to every merged PR, on every branch (GitHub requires this trigger filter to be static
+# YAML - it can't read settings.json before the job starts). The enabled/branch check happens
+# inside the job itself, driven by the "autoReleaseOnMerge" setting - see
+# DEPLOYMENT-SCHEDULING.md for details and known limitations.
+#
+# Deliberately scoped to real PR merges only (not "any CI/CD success" - that would also fire on
+# CI/CD's own scheduled/nightly runs and manual dispatches, with no merge involved at all). To
+# still guarantee the release is only created from a validated commit, the job waits for the
+# CI/CD run on the exact merge commit to complete successfully before triggering the release,
+# instead of firing immediately and racing the asynchronous CI/CD run that starts right after
+# the merge - see DEPLOYMENT-SCHEDULING.md for the incident this avoids.
 on:
-  workflow_run:
-    workflows: [ 'CI/CD' ]
-    types: [ completed ]
+  pull_request:
+    types: [ closed ]
 
 permissions:
   actions: read
@@ -18,7 +21,7 @@ permissions:
 
 jobs:
   CheckAndTriggerRelease:
-    if: github.event.workflow_run.conclusion == 'success'
+    if: github.event.pull_request.merged == true
     runs-on: windows-latest
     defaults:
       run:
@@ -27,7 +30,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ github.event.workflow_run.head_sha }}
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
 
       - name: Read settings
         id: ReadSettings
@@ -38,7 +41,8 @@ jobs:
       - name: Check settings and trigger release if enabled
         env:
           GH_TOKEN: ${{ github.token }}
-          BaseRef: ${{ github.event.workflow_run.head_branch }}
+          BaseRef: ${{ github.event.pull_request.base.ref }}
+          MergeSha: ${{ github.event.pull_request.merge_commit_sha }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
@@ -52,9 +56,40 @@ jobs:
 
           $branches = @($auto.branches)
           if ($branches -notcontains $env:BaseRef) {
-              Write-Host "CI/CD succeeded on '$($env:BaseRef)', which is not in autoReleaseOnMerge.branches ($($branches -join ', ')). Nothing to do."
+              Write-Host "PR was merged into '$($env:BaseRef)', which is not in autoReleaseOnMerge.branches ($($branches -join ', ')). Nothing to do."
               exit 0
           }
+
+          # Wait for CI/CD to complete (successfully) on the exact merge commit before releasing.
+          # CI/CD is triggered asynchronously by the push that the merge produces, so it may not
+          # exist yet the moment this job starts - poll for it instead of assuming it's already
+          # there. This only waits for the run tied to *this* merge commit, not just any CI/CD
+          # success, so a scheduled/nightly CI/CD run elsewhere never triggers a release here.
+          $timeoutMinutes = 90
+          $pollSeconds = 30
+          $deadline = (Get-Date).AddMinutes($timeoutMinutes)
+          Write-Host "Waiting (up to $timeoutMinutes minutes) for CI/CD to succeed on merge commit $($env:MergeSha)..."
+
+          $run = $null
+          while ((Get-Date) -lt $deadline) {
+              $runs = gh run list --workflow "CI/CD" --branch $env:BaseRef --json headSha,status,conclusion,databaseId --limit 50 | ConvertFrom-Json
+              $run = $runs | Where-Object { $_.headSha -eq $env:MergeSha } | Select-Object -First 1
+              if ($run -and $run.status -eq 'completed') {
+                  break
+              }
+              Start-Sleep -Seconds $pollSeconds
+          }
+
+          if (-not $run) {
+              throw "No CI/CD run found for merge commit $($env:MergeSha) within $timeoutMinutes minutes. Aborting - cannot confirm this merge was validated. Check the Actions tab and re-run this workflow manually once CI/CD has completed if needed."
+          }
+          if ($run.status -ne 'completed') {
+              throw "CI/CD run $($run.databaseId) for merge commit $($env:MergeSha) did not complete within $timeoutMinutes minutes (still '$($run.status)'). Aborting - no release was triggered."
+          }
+          if ($run.conclusion -ne 'success') {
+              throw "CI/CD run $($run.databaseId) for merge commit $($env:MergeSha) finished with conclusion '$($run.conclusion)', not 'success'. Aborting - no release was triggered for an unvalidated commit."
+          }
+          Write-Host "CI/CD run $($run.databaseId) succeeded on merge commit $($env:MergeSha). Proceeding."
 
           # Derive the release tag from the main app's version in app.json.
           # Heuristic: first app.json found, excluding folders that look like test/performance apps.

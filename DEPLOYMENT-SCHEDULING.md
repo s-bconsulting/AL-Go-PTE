@@ -71,20 +71,21 @@ L'API `pteInstall` installe **un seul fichier `.app` par appel** — le script b
 
 ## Workflow `Auto Release On Merge` (ajouté le 14/09/2026, ⚠️ non testé)
 
-`.github/workflows/AutoReleaseOnMerge.yaml` — déclenche automatiquement une release (et éventuellement son déploiement planifié) dès que la CI/CD réussit sur une branche surveillée, sans action manuelle.
+`.github/workflows/AutoReleaseOnMerge.yaml` — déclenche automatiquement une release (et éventuellement son déploiement planifié) dès qu'une PR est mergée dans une branche surveillée, sans action manuelle.
 
-### ⚠️ Pourquoi ce n'est pas déclenché directement par le merge de la PR
+### ⚠️ Pourquoi il attend la CI/CD avant de déclencher, sans pour autant réagir à "n'importe quelle CI/CD"
 
-Une première version se déclenchait sur `pull_request: types: [closed]`, c'est-à-dire **immédiatement** au moment du merge. Deux problèmes avec ça :
+Le déclencheur reste volontairement `pull_request: types: [closed]` (un vrai merge de PR, sur une branche choisie) — **pas** `workflow_run` sur la réussite de la CI/CD en général. Réagir à n'importe quel run CI/CD réussi aurait aussi déclenché des releases sur le **run planifié nocturne** (`schedule`/cron, que `CI/CD.yaml` d'AL-Go inclut généralement) ou un `workflow_dispatch` manuel, sans qu'aucun merge n'ait eu lieu — bien plus large que ce qu'on veut.
 
-1. **Aucune garantie que la CI/CD ait réussi** sur le commit mergé — sans règle de protection de branche exigeant ce check (voir section suivante), GitHub autorise le merge même si la CI/CD est rouge, en cours, ou n'a jamais tourné.
-2. **Effet de course** : même quand la CI/CD finit par réussir, elle démarre de façon asynchrone après le merge (déclenchée par le push sur la branche). Le workflow se déclenchant *au moment même du merge* tirait donc quasi systématiquement **avant** la fin de ce run, et `DetermineArtifactsForRelease` (dans `CreateRelease`/`CreateReleaseWithDeploy`) refusait la release avec `"The main branch has changed since the last successful build."` — pas un vrai garde-fou, juste un échec de timing.
+Le problème restait cependant réel : réagir *immédiatement* au merge tirait quasi systématiquement **avant** la fin du run CI/CD que ce même merge déclenche de façon asynchrone (via le push sur la branche), et `DetermineArtifactsForRelease` (dans `CreateRelease`/`CreateReleaseWithDeploy`) refusait alors la release avec `"The main branch has changed since the last successful build."` — pas un vrai garde-fou, juste un échec de timing.
 
-**La version actuelle se déclenche sur `workflow_run: workflows: ['CI/CD'], types: [completed]`, filtré par `if: github.event.workflow_run.conclusion == 'success'`.** Une release n'est donc jamais tentée sans qu'un run CI/CD ait explicitement réussi sur ce commit précis — que ce run vienne d'un merge de PR ou d'un push direct sur la branche.
+**La version actuelle résout ça sans changer le déclencheur** : une fois le merge confirmé éligible (`enabled` + branche surveillée), le job **attend** (poll toutes les 30s, jusqu'à 90 minutes) qu'un run `CI/CD` correspondant **exactement** au commit de merge (`merge_commit_sha`) se termine, puis vérifie que sa conclusion est `success` avant de déclencher la release. Si la CI/CD échoue ou n'a pas terminé dans le délai, le workflow s'arrête en erreur et **aucune release n'est créée**.
 
-### Recommandation : protection de branche
+Contrepartie : le job reste actif (sur un runner GitHub hébergé `windows-latest`) pendant toute cette attente, ce qui consomme des minutes facturées le temps que la CI/CD tourne. À surveiller si `autoReleaseOnMerge` est activé sur un repo où la CI/CD est longue ou fréquente ; faire tourner ce job sur le runner self-hosted serait une option si le coût devient significatif.
 
-Ce workflow ne remplace pas une règle de protection de branche — il garantit qu'*une release ne parte pas* sans CI/CD verte, mais n'empêche pas en soi un merge non validé. Pour un vrai garde-fou en amont (comme configuré sur `SBLawyer-AL` → branche `master` : 1 review obligatoire, push direct restreint, force-push/suppression bloqués), il est recommandé d'activer sur la branche surveillée par `autoReleaseOnMerge` :
+### Recommandation complémentaire : protection de branche
+
+Ce workflow garantit qu'*une release ne parte pas* sans CI/CD verte sur le commit mergé, mais n'empêche pas en soi un merge non validé (rien n'oblige la CI/CD à être verte pour que le bouton "Merge" soit cliquable). Pour un vrai garde-fou en amont (comme configuré sur `SBLawyer-AL` → branche `master` : 1 review obligatoire, push direct restreint, force-push/suppression bloqués), il est recommandé d'activer sur la branche surveillée par `autoReleaseOnMerge` :
 
 - **Required status checks** = le workflow `CI/CD` (empêche le clic "Merge" tant qu'il n'est pas vert).
 - **Required pull request reviews** (au moins 1 approbation).
@@ -103,7 +104,7 @@ Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource`
   }
   ```
   - `enabled: false` par défaut — rien ne se passe tant que ce n'est pas mis à `true` explicitement.
-  - `branches` : liste des branches à surveiller (une CI/CD réussie sur une autre branche est ignorée).
+  - `branches` : liste des branches de destination à surveiller (un merge vers une autre branche est ignoré).
   - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
 - Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
 - Dérive automatiquement le tag de release depuis `app.json` (`Major.Minor.0`), via une **heuristique** : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
