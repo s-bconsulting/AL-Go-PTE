@@ -128,8 +128,17 @@ jobs:
           # If app.json's version hasn't changed since the last release, this merge didn't bump
           # it (e.g. no version-bump policy was applied in the PR) - skip rather than fail on a
           # duplicate tag.
+          # "gh release view" writes to stderr and exits non-zero when the tag doesn't exist yet -
+          # the expected, common case here. Under $ErrorActionPreference = "Stop", Windows
+          # PowerShell 5.1 turns that stderr write into a terminating NativeCommandError even with
+          # 2>$null redirection - confirmed by a real run crashing here on a brand new tag.
+          # Temporarily relax it so $LASTEXITCODE can actually be checked.
+          $previousEAP = $errorActionPreference
+          $errorActionPreference = "SilentlyContinue"
           gh release view $tag --json tagName 1>$null 2>$null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseAlreadyExists = ($LASTEXITCODE -eq 0)
+          $errorActionPreference = $previousEAP
+          if ($releaseAlreadyExists) {
               Write-Host "A release tagged '$tag' already exists - app.json version wasn't bumped since the last release. Nothing to do."
               exit 0
           }
