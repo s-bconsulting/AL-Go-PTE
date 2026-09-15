@@ -42,7 +42,9 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           BaseRef: ${{ github.event.pull_request.base.ref }}
+          HeadRef: ${{ github.event.pull_request.head.ref }}
           MergeSha: ${{ github.event.pull_request.merge_commit_sha }}
+          Repository: ${{ github.repository }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
@@ -91,7 +93,11 @@ jobs:
           }
           Write-Host "CI/CD run $($run.databaseId) succeeded on merge commit $($env:MergeSha). Proceeding."
 
-          # Derive the release tag from the main app's version in app.json.
+          # Derive the release tag from the main app's version in app.json, verbatim (all 4
+          # segments, unchanged) - do NOT collapse it to a 3-segment "Major.Minor.0" shape.
+          # Unlike a generic build/revision counter, every segment here can carry real meaning
+          # (e.g. a product major/CU/fix scheme plus a manually-set BC-compatibility marker) -
+          # rewriting the version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
           # Heuristic: first app.json found, excluding folders that look like test/performance apps.
           # If your repo layout doesn't match this assumption, adjust this section.
           $appJsonFile = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
@@ -103,9 +109,22 @@ jobs:
           }
 
           $appJson = Get-Content $appJsonFile.FullName -Raw | ConvertFrom-Json
-          $version = [System.Version]$appJson.version
-          $tag = "$($version.Major).$($version.Minor).0"
+          try {
+              [void][System.Version]$appJson.version
+          } catch {
+              throw "app.json version '$($appJson.version)' in $($appJsonFile.FullName) is not a valid version string."
+          }
+          $tag = $appJson.version
           Write-Host "Derived tag '$tag' from $($appJsonFile.FullName)"
+
+          # If app.json's version hasn't changed since the last release, this merge didn't bump
+          # it (e.g. no version-bump policy was applied in the PR) - skip rather than fail on a
+          # duplicate tag.
+          gh release view $tag --json tagName 1>$null 2>$null
+          if ($LASTEXITCODE -eq 0) {
+              Write-Host "A release tagged '$tag' already exists - app.json version wasn't bumped since the last release. Nothing to do."
+              exit 0
+          }
 
           $workflowFile = if ($auto.workflowType -eq 'ReleaseWithDeploy') { 'CreateReleaseWithDeploy.yaml' } else { 'CreateRelease.yaml' }
 
@@ -116,3 +135,21 @@ jobs:
               -f name="Release $tag" `
               -f tag=$tag `
               -f releaseType=Release
+
+          # app.json on $BaseRef (main) stays frozen at the version that was just released - it
+          # must never be bumped here. Instead, bump the version on the branch this PR came FROM
+          # (the persistent development branch, e.g. "develop"), so ongoing work already targets
+          # the next version. Controlled by autoReleaseOnMerge.versionIncrement, defaulting to
+          # "+0.0.1" (advances the build/fix segment only) if not set. See DEPLOYMENT-SCHEDULING.md.
+          $versionIncrement = if ($auto.versionIncrement) { $auto.versionIncrement } else { '+0.0.1' }
+
+          gh api "repos/$($env:Repository)/branches/$($env:HeadRef)" 1>$null 2>$null
+          if ($LASTEXITCODE -ne 0) {
+              Write-Host "::warning::Development branch '$($env:HeadRef)' no longer exists (deleted on merge?) - skipping automatic version increment. Bump it manually if needed."
+          } else {
+              Write-Host "Incrementing version by '$versionIncrement' on development branch '$($env:HeadRef)'"
+              gh workflow run IncrementVersionNumber.yaml `
+                  --ref $env:HeadRef `
+                  -f versionNumber=$versionIncrement `
+                  -f directCommit=true
+          }

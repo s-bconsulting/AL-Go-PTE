@@ -100,15 +100,77 @@ Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource`
   "autoReleaseOnMerge": {
     "enabled": false,
     "branches": [ "main" ],
-    "workflowType": "ReleaseWithDeploy"
+    "workflowType": "ReleaseWithDeploy",
+    "versionIncrement": "+0.0.1"
   }
   ```
   - `enabled: false` par défaut — rien ne se passe tant que ce n'est pas mis à `true` explicitement.
   - `branches` : liste des branches de destination à surveiller (un merge vers une autre branche est ignoré).
   - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
+  - `versionIncrement` : valeur passée à `IncrementVersionNumber` sur la branche de développement après la release (voir section suivante) — défaut `"+0.0.1"` si absent.
 - Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
-- Dérive automatiquement le tag de release depuis `app.json` (`Major.Minor.0`), via une **heuristique** : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
+- Dérive le tag de release depuis `app.json`, **verbatim, les 4 segments tels quels** (ex. `10.4.3.280`) — pas de recomposition en 3 segments. Heuristique de recherche : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
+- Si un tag portant cette version existe déjà (le merge n'a pas fait bouger `app.json`), le workflow s'arrête sans rien faire plutôt que d'échouer sur un tag dupliqué.
+
+### Convention de version chez SB Consulting
+
+Contrairement à un simple compteur de build, chez SB Consulting chaque segment de `app.json.version` porte un sens précis, décidé manuellement — ni AL-Go, ni ce workflow ne doivent le recalculer automatiquement :
+
+| Segment | Rôle |
+|---|---|
+| 1 (Majeur) | Version majeure du produit SB Consulting lui-même (indépendante du cycle de Microsoft — un produit plus récent que BC n'a pas à démarrer à une version aussi haute que BC). |
+| 2 (CU) | Cumulative Update du produit. |
+| 3 (Mineur/Fix) | Fait aussi office de compteur de build — chaque correctif publié l'incrémente. |
+| 4 (marqueur BC) | **Pas un numéro de build** — fixé manuellement, encode la version de Business Central visée (ex. `280` = BC 28 CU 0). Ne change que lors d'un portage vers une nouvelle version de BC, jamais à chaque release. |
+
+Conséquence directe : `app.json.version` doit être bumpé **par la PR elle-même** (politique d'équipe) avant un merge qui doit déclencher une release — `AutoReleaseOnMerge` ne le fait jamais à la place de vous. C'est déjà la convention manuelle utilisée sur `SBLawyer-AL` (où `app.json` sur `main` correspond toujours exactement au tag de la dernière release) ; ce workflow ne fait que l'automatiser une fois la convention respectée en amont.
+
+**⚠️ Non vérifié en pratique** : le tag est transmis tel quel à l'API GitHub de création de release (`createRelease`, aucun parsing semver à cette étape), donc un tag à 4 segments devrait fonctionner sans souci — mais si `CreateReleaseNotes` (génération du changelog) compare des tags entre eux, un comportement avec des tags à 4 segments n'a pas encore été observé en conditions réelles. À surveiller au premier run.
+
+### Incrément de version après la release — sur la branche de développement, jamais sur `main`
+
+`main` reste volontairement figé à la version qui vient d'être publiée — c'est ce qui permet à `app.json` et au tag de release de rester identiques (voir tableau ci-dessus). Mais l'équipe veut quand même que la prochaine version cible soit déjà en place pour la suite du développement, **sans y toucher sur `main`**.
+
+Le workflow bascule donc l'incrément de version sur la branche **source** de la PR qui vient d'être mergée (`github.event.pull_request.head.ref`) — la branche de développement persistante (ex. `develop`), sur laquelle les développeurs continuent de merger leurs propres branches avant qu'elle ne soit à son tour mergée dans `main` pour déclencher une release.
+
+- Valeur appliquée : `autoReleaseOnMerge.versionIncrement` (défaut `"+0.0.1"` si absent) — avance uniquement le 3ᵉ segment (Mineur/Fix), laisse Majeur/CU/marqueur BC intacts. Passé tel quel à l'action `IncrementVersionNumber` du workflow `IncrementVersionNumber.yaml` (inchangé, standard AL-Go), déclenché avec `--ref` sur cette branche.
+- **Ne bloque jamais la release** : les deux déclenchements (`Create release`/`Create Release With Deploy`, puis `IncrementVersionNumber`) sont deux runs Actions indépendants — un souci sur le second n'affecte pas le premier.
+- **Garde-fou** : si la branche de développement n'existe plus (cas exceptionnel — elle est censée être persistante, jamais supprimée après un merge), le workflow log un avertissement (`::warning::`) et n'essaie pas de déclencher `IncrementVersionNumber` sur une branche inexistante ; l'incrément est alors à faire manuellement.
+- L'incrément se fait en `directCommit: true` (commit direct sur la branche de développement, pas de PR à valider en plus) — à changer directement dans le workflow si vous préférez une PR ici aussi.
+- **`versioningStrategy: 3` est obligatoire** (ajouté dans `.AL-Go/settings.json`) — confirmé en lisant le code source de `microsoft/AL-Go-Actions/IncrementVersionNumber@v9.2` (`IncrementVersionNumber.ps1`) : l'incrément `+0.0.1` n'est autorisé que si `($settings.versioningStrategy -band 15) -eq 3`, sinon l'action échoue avec `"Incremental version number +0.0.1 is not allowed. Allowed incremental version numbers are: +1, +0.1"`. Sans ce réglage, ni cette fonctionnalité ni la suivante ne peuvent fonctionner avec le défaut `+0.0.1`.
+
+## Workflow `Auto Increment On CICD` (ajouté le 15/09/2026, ⚠️ non testé)
+
+`.github/workflows/AutoIncrementOnCICD.yaml` — fait avancer automatiquement `app.json` sur la branche de développement à **chaque** réussite de CI/CD, indépendamment de toute release. Complète `Auto Release On Merge` (qui ne bump la branche de dev qu'une seule fois, juste après une release) par un incrément continu au fil du développement.
+
+### Fonctionnement
+
+- Se déclenche sur `workflow_run: workflows: ['CI/CD'], types: [completed]`, filtré par `if: conclusion == 'success'` — volontairement pas de filtre statique par branche ici (`CICD.yaml` s'en occupe déjà via son propre `on.push.branches`), le filtrage par branche pour l'incrément se fait à l'intérieur du job.
+- Lit `.AL-Go/settings.json` → `autoIncrementOnCICD` :
+  ```json
+  "autoIncrementOnCICD": {
+    "enabled": false,
+    "branches": [ "develop" ],
+    "versionIncrement": "+0.0.1"
+  }
+  ```
+  - `enabled: false` par défaut.
+  - `branches` : **volontairement une liste précise, pas "toutes les branches"** — sur une branche perso de développeur, chacune bumperait son propre `app.json` indépendamment, garantissant des conflits à la fusion. `"develop"` est un nom générique par défaut, **à adapter au nom réel de votre branche de développement partagée**.
+  - `versionIncrement` : même valeur/rôle que sur `Auto Release On Merge`, défaut `"+0.0.1"`.
+- **`CICD.yaml` doit déclencher `push` sur cette branche** pour que ce workflow ait quoi que ce soit à réagir — `develop` a été ajoutée à `on.push.branches` dans `CICD.yaml` en conséquence (à ajuster si votre branche a un autre nom).
+
+### ⚠️ Risque de boucle infinie — comment il est évité
+
+Ce workflow, à chaque incrément réussi, fait un commit direct (`directCommit: true`) sur la branche surveillée — et `CICD.yaml` déclenche `push` sur cette même branche, sans exclure `app.json` de son `paths-ignore`. Sans protection, ce commit **redéclenche la CI/CD**, qui en réussissant redéclenche un nouvel incrément, indéfiniment.
+
+En lisant le code source de l'action (`IncrementVersionNumber.ps1`, v9.2), le message de commit qu'elle produit est **toujours** l'un des deux suivants, sans aucun marqueur `[skip ci]` :
+- `"Incremented Version number by <valeur>"` (incrément relatif, ex. `+0.0.1`)
+- `"New Version number <valeur>"` (valeur absolue)
+
+Le job vérifie donc `github.event.workflow_run.head_commit.message` et **s'arrête sans rien faire** si ce message correspond à l'un de ces deux formats — évite la boucle sans avoir à modifier l'action Microsoft elle-même.
+
+**⚠️ Non testé en conditions réelles** — comme le reste de cette série de workflows. Le garde-fou anti-boucle repose sur un texte de commit observé dans le code source actuel (v9.2) de l'action Microsoft ; à revalider si vous montez de version d'AL-Go.
 
 ### ⚠️ Point de vigilance majeur
 
-Une fois `enabled: true`, **chaque merge sur une branche surveillée déclenche une vraie release et potentiellement un vrai déploiement planifié en production**, sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
+Une fois `enabled: true` (sur `Auto Release On Merge` et/ou `Auto Increment On CICD`), des commits/releases/déploiements automatiques peuvent se produire sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
