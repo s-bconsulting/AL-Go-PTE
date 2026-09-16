@@ -210,29 +210,35 @@ Remplacement ciblé du seul champ concerné dans le texte brut du fichier (regex
 
 Le commit correctif utilise **toujours** le `GITHUB_TOKEN` par défaut du job (jamais le PAT `GHTOKENWORKFLOW`), quel que soit le réglage `useGhTokenWorkflow` passé pour l'incrément lui-même. Comme confirmé plus haut, un push fait avec `GITHUB_TOKEN` ne déclenche jamais de workflow `on: push` — donc ni la CI/CD, ni `Auto Increment On CICD` ne se redéclenchent à cause de ce commit, exactement comme le premier commit de l'action Microsoft.
 
-### `repoVersion` aligné sur `app.json` — le bit 16 de `versioningStrategy`
+### `repoVersion` aligné sur `app.json` — synchronisé nous-mêmes, pas via le bit 16
 
-Exigence : `repoVersion` doit porter le même nom/tag que la version de l'app (sauf en multi-projets, où chaque projet a son propre `settings.json` et peut activer ce bit indépendamment — rien de spécial à faire). Le seul mécanisme standard (sans code custom) pour ça est le bit `16` de `versioningStrategy` (`useRepoVersion`), confirmé dans `Set-VersionInAppManifests` :
+Exigence : `repoVersion` doit porter le même nom/tag que la version de l'app (sauf en multi-projets, où chaque projet a son propre `settings.json`).
+
+**Première tentative abandonnée** : le bit `16` de `versioningStrategy` (`useRepoVersion`), documenté dans `Set-VersionInAppManifests` :
 ```powershell
 $useRepoVersion = (($projectSettings.versioningStrategy -band 16) -eq 16)
 if ($useRepoVersion) {
     $newValue = $projectSettings.repoVersion
 }
 ```
-Quand ce bit est actif, AL-Go force **chaque** `app.json` du projet à prendre la valeur de `repoVersion` à chaque incrément. D'où `versioningStrategy: 19` (`3 + 16`) au lieu de `3` seul — garde la syntaxe `+0.0.1` **et** active la synchronisation.
+devrait forcer chaque `app.json` à prendre la valeur de `repoVersion` à chaque incrément. **Testé en conditions réelles (16/09/2026) : ça ne se comporte pas comme documenté.** Après qu'un edit manuel d'`app.json` (hors du workflow d'incrément) a cassé l'alignement initial, l'incrément automatique suivant n'a **pas** resynchronisé `app.json` sur `repoVersion` — chaque fichier a continué d'avancer indépendamment depuis sa propre valeur, l'écart se creusant à chaque `+0.1`/`+0.0.1`. Repro confirmée en comparant les diffs exacts des commits AL-Go successifs. Cause exacte non identifiée (résolution des settings par projet ?) — pas assez fiable pour en dépendre.
 
-`repoVersion` reste volontairement à **3 segments** (`Major.Minor.Build`, sans 4ᵉ) — pas besoin de l'aligner à 4 segments pour que ça marche : quand AL-Go propage une valeur absolue à 3 segments vers un `app.json` qui en a déjà 4, il rajoute automatiquement un `0` en 4ᵉ position (`if ($oldVersion.Revision -ne -1) { $versionNumbers += 0 }`, même fonction). Le 4ᵉ segment ne porte de toute façon aucune information puisqu'il est toujours écrasé à la compilation.
+**Solution retenue : on fait la synchronisation nous-mêmes**, dans notre propre étape `Fix BC version marker`, plutôt que de compter sur ce bit. Après avoir corrigé le marqueur BC de chaque `app.json`, l'étape relit la version de l'**app principale** (même heuristique que la dérivation du tag dans `Auto Release On Merge` : premier `app.json` hors dossiers `.Test`/`.PerformanceTest`) et force `repoVersion` à valoir exactement son `Major.Minor.Build` — à chaque run, que le marqueur ait eu besoin d'être corrigé ou non. `app.json` reste l'unique source de vérité ; `repoVersion` le suit systématiquement.
+
+`versioningStrategy` reste donc à **`3` seul** (pas `19`) — le bit 16 n'est plus utilisé du tout.
+
+`repoVersion` reste à **3 segments** (`Major.Minor.Build`, sans 4ᵉ) — le 4ᵉ segment ne porte de toute façon aucune information puisqu'il est toujours écrasé à la compilation.
 
 ### Réglages
 
 ```json
-"versioningStrategy": 19,
+"versioningStrategy": 3,
 "versionBCPreserve": true,
 "versionBCMarker": 28
 ```
 
-- `versionBCPreserve` : `false` par défaut (absent = désactivé) — rien de custom ne s'exécute, comportement 100% standard AL-Go.
+- `versionBCPreserve` : `false` par défaut (absent = désactivé) — rien de custom ne s'exécute, comportement 100% standard AL-Go (y compris la synchro `repoVersion`, qui fait partie du même mécanisme).
 - `versionBCMarker` : `0` ou absent désactive aussi la correction (traité comme "pas de marqueur à appliquer"), même si `versionBCPreserve` est à `true`.
-- **Volontairement indépendant de la valeur exacte de `versioningStrategy`** (au-delà du bit 16 nécessaire pour `repoVersion`) — coupler notre logique à un nombre précis aurait été fragile si Microsoft change un jour le sens de ce réglage.
+- **Volontairement indépendant de la valeur exacte de `versioningStrategy`** — coupler notre logique à un nombre précis aurait été fragile si Microsoft change un jour le sens de ce réglage.
 
-**⚠️ Non testé en conditions réelles au moment de l'écriture** (refonte du 16/09/2026) — la version précédente (préservation du 4ᵉ segment) avait été validée en conditions réelles, mais cette nouvelle approche (marqueur+compteur sur le 3ᵉ segment, plus la synchro `repoVersion`) n'a pas encore été exercée par un vrai run. À valider au prochain incrément réel.
+**⚠️ Non testé en conditions réelles au moment de l'écriture** (refonte du 16/09/2026, v2 — abandon du bit 16 au profit d'une synchro maison) — à valider au prochain incrément réel.
