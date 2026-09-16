@@ -101,11 +101,11 @@ jobs:
           }
           Write-Host "CI/CD run $($run.databaseId) succeeded on merge commit $($env:MergeSha). Proceeding."
 
-          # Derive the release tag from the main app's version in app.json, verbatim (all 4
-          # segments, unchanged) - do NOT collapse it to a 3-segment "Major.Minor.0" shape.
-          # Unlike a generic build/revision counter, every segment here can carry real meaning
-          # (e.g. a product major/CU/fix scheme plus a manually-set BC-compatibility marker) -
-          # rewriting the version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
+          # Derive the release tag from the main app's version in app.json, preserving all 4
+          # segments - do NOT collapse it to a 3-segment "Major.Minor.0" shape. Unlike a generic
+          # build/revision counter, every segment here can carry real meaning (e.g. a product
+          # major/CU/fix scheme plus a manually-set BC-compatibility marker) - rewriting the
+          # version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
           # Heuristic: first app.json found, excluding folders that look like test/performance apps.
           # If your repo layout doesn't match this assumption, adjust this section.
           $appJsonFile = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
@@ -118,11 +118,17 @@ jobs:
 
           $appJson = Get-Content $appJsonFile.FullName -Raw | ConvertFrom-Json
           try {
-              [void][System.Version]$appJson.version
+              $version = [System.Version]$appJson.version
           } catch {
               throw "app.json version '$($appJson.version)' in $($appJsonFile.FullName) is not a valid version string."
           }
-          $tag = $appJson.version
+          # A plain 4-segment tag (e.g. "1.9.2.0") is NOT valid SemVer and breaks CreateReleaseNotes
+          # ("'1.9.2.0' cannot be recognized as a semantic version string") - confirmed on a real
+          # run, from AL-Go-Actions/Github-Helper.psm1's SemVerStrToSemVerObj, which parses only
+          # Major.Minor.Patch then, optionally, "-<additional segments separated by '.'>". Putting
+          # the 4th segment after a dash keeps it fully valid SemVer while still preserving it
+          # losslessly (e.g. "1.9.2-0" instead of "1.9.2.0").
+          $tag = "$($version.Major).$($version.Minor).$($version.Build)-$($version.Revision)"
           Write-Host "Derived tag '$tag' from $($appJsonFile.FullName)"
 
           # If app.json's version hasn't changed since the last release, this merge didn't bump

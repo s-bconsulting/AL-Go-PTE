@@ -109,7 +109,7 @@ Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource`
   - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
   - `versionIncrement` : valeur passée à `IncrementVersionNumber` sur la branche de développement après la release (voir section suivante) — défaut `"+0.0.1"` si absent.
 - Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
-- Dérive le tag de release depuis `app.json`, **verbatim, les 4 segments tels quels** (ex. `10.4.3.280`) — pas de recomposition en 3 segments. Heuristique de recherche : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
+- Dérive le tag de release depuis `app.json`, en préservant les 4 segments — mais **pas au format brut `Major.Minor.Build.Revision`** (voir le point ⚠️ ci-dessous). Heuristique de recherche : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
 - Si un tag portant cette version existe déjà (le merge n'a pas fait bouger `app.json`), le workflow s'arrête sans rien faire plutôt que d'échouer sur un tag dupliqué.
 
 ### Convention de version chez SB Consulting
@@ -125,7 +125,9 @@ Contrairement à un simple compteur de build, chez SB Consulting chaque segment 
 
 Conséquence directe : `app.json.version` doit être bumpé **par la PR elle-même** (politique d'équipe) avant un merge qui doit déclencher une release — `AutoReleaseOnMerge` ne le fait jamais à la place de vous. C'est déjà la convention manuelle utilisée sur `SBLawyer-AL` (où `app.json` sur `main` correspond toujours exactement au tag de la dernière release) ; ce workflow ne fait que l'automatiser une fois la convention respectée en amont.
 
-**⚠️ Non vérifié en pratique** : le tag est transmis tel quel à l'API GitHub de création de release (`createRelease`, aucun parsing semver à cette étape), donc un tag à 4 segments devrait fonctionner sans souci — mais si `CreateReleaseNotes` (génération du changelog) compare des tags entre eux, un comportement avec des tags à 4 segments n'a pas encore été observé en conditions réelles. À surveiller au premier run.
+**⚠️ Confirmé en conditions réelles (16/09/2026) : un tag à 4 segments bruts (`Major.Minor.Build.Revision`, ex. `1.9.2.0`) casse `CreateReleaseNotes`** avec `'1.9.2.0' cannot be recognized as a semantic version string`. Cause, confirmée dans le code source de l'action Microsoft (`Github-Helper.psm1`, fonction `SemVerStrToSemVerObj`) : elle n'accepte que `Major.Minor.Patch`, éventuellement suivi de `-<segments additionnels séparés par '.'>` — un 4ᵉ segment numérique brut après un point la fait échouer (`if ($version.Revision -ne -1) { throw "not semver" }`).
+
+**Le tag est donc construit comme `Major.Minor.Build-Revision`** (ex. `1.9.2-0` au lieu de `1.9.2.0`) — un tiret avant le 4ᵉ segment au lieu d'un point. C'est du SemVer valide (le `-` introduit les "segments additionnels" que l'action sait lire et reconstruire à l'identique), et l'information du 4ᵉ segment n'est pas perdue, juste reponctuée.
 
 ### Incrément de version après la release — sur la branche de développement, jamais sur `main`
 
@@ -197,6 +199,8 @@ Ce n'est pas conditionné par le type d'incrément (`+1`, `+0.1`, `+0.0.1`, ou u
 2. L'étape standard Microsoft tourne normalement (et remet chaque 4ᵉ segment à `0`, comme toujours).
 3. **`Restore BC version segment`** (après, uniquement si `directCommit: true`) : récupère le commit que l'étape précédente vient de pousser, remet le 4ᵉ segment de chaque `app.json` à la valeur mémorisée à l'étape 1, et commit ce correctif séparément.
 
+**⚠️ Bug trouvé et corrigé (16/09/2026)** : la première version de l'étape 3 réécrivait tout le fichier via `ConvertTo-Json` — ce qui réindente/reformate **tout** `app.json`, pas seulement la valeur `version` (confirmé : un `app.json` entier s'est retrouvé réindenté après un run réel). Corrigé par un remplacement ciblé du seul champ `"version"` dans le texte brut du fichier (regex sur `"version"(\s*:\s*)"<ancienne valeur>"`), qui laisse chaque autre ligne strictement inchangée.
+
 Résultat : **deux commits** par incrément (celui de l'action Microsoft, puis notre correctif) au lieu d'un seul — accepté comme compromis pour ne pas avoir à réimplémenter toute la logique de l'action (résolution des projets, synchro des dépendances entre apps, gestion de `repoVersion`).
 
 ### Pourquoi ça ne déclenche pas les automatisations deux fois
@@ -212,4 +216,4 @@ Le commit correctif utilise **toujours** le `GITHUB_TOKEN` par défaut du job (j
 - `false` par défaut (absent = désactivé) — rien ne change tant que ce n'est pas activé explicitement.
 - **Volontairement indépendant de `versioningStrategy`** — ce dernier reste un réglage propre à Microsoft (contrôle les syntaxes d'incrément autorisées par l'action), sans lien numérique avec notre propre logique de préservation. Coupler les deux aurait été fragile : si Microsoft change un jour le sens de `versioningStrategy`, notre fonctionnalité se serait arrêtée de fonctionner silencieusement, sans rapport apparent.
 
-**⚠️ Non testé en conditions réelles au moment de l'écriture** — comme le reste de cette série de fonctionnalités, à valider au premier run réel avec `versionBCPreserve: true`.
+**✅ Validé en conditions réelles (16/09/2026)** sur `main` et `OnPrem` — les deux bugs ci-dessus (réindentation, et le tag SemVer plus haut) ont été trouvés et corrigés grâce à ce test.

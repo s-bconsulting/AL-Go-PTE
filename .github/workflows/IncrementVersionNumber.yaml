@@ -156,13 +156,23 @@ jobs:
               if (-not (Test-Path $path)) {
                   continue
               }
-              $appJson = Get-Content $path -Raw | ConvertFrom-Json
+              $rawContent = Get-Content $path -Raw
+              $appJson = $rawContent | ConvertFrom-Json
               $version = [System.Version]$appJson.version
               if ($version.Revision -ne $originalRevision) {
+                  $oldVersionStr = $appJson.version
                   $newVersion = "$($version.Major).$($version.Minor).$($version.Build).$originalRevision"
-                  Write-Host "Restoring BC version segment in $path : $($appJson.version) -> $newVersion"
-                  $appJson.version = $newVersion
-                  $appJson | ConvertTo-Json -Depth 20 | Set-Content -Path $path -Encoding UTF8
+                  Write-Host "Restoring BC version segment in $path : $oldVersionStr -> $newVersion"
+                  # Targeted text replace of just the version value - NOT ConvertTo-Json on the
+                  # whole object, which reformats/reindents the entire file (confirmed on a real
+                  # run: the whole app.json came out reindented). This keeps every other line
+                  # byte-for-byte untouched.
+                  $pattern = '"version"(\s*:\s*)"' + [regex]::Escape($oldVersionStr) + '"'
+                  if ($rawContent -notmatch $pattern) {
+                      throw "Could not find the exact 'version' field ('$oldVersionStr') to restore in $path - refusing to guess and risk corrupting the file."
+                  }
+                  $newContent = $rawContent -replace $pattern, ('"version"$1"' + $newVersion + '"')
+                  Set-Content -Path $path -Value $newContent -NoNewline -Encoding UTF8
                   $changed = $true
               }
           }
