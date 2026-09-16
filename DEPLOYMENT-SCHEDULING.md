@@ -178,42 +178,61 @@ Le garde-fou applicatif (vérifier `github.event.workflow_run.head_commit.messag
 
 Une fois `enabled: true` (sur `Auto Release On Merge` et/ou `Auto Increment On CICD`), des commits/releases/déploiements automatiques peuvent se produire sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
 
-## Réglage `versionBCPreserve` — préserver le 4ᵉ segment (marqueur BC) à travers les incréments (ajouté le 16/09/2026)
+## Réglage `versionBCPreserve` — encoder le marqueur BC dans le 3ᵉ segment (refonte du 16/09/2026)
 
-**Constaté en conditions réelles** : un incrément manuel du 4ᵉ segment de `app.json` (ex. mettre `.280` pour marquer la compatibilité avec BC 28 CU 0) est **écrasé et remis à `0`** dès le prochain passage de `Auto Release On Merge` ou `Auto Increment On CICD`.
+### Pourquoi le 4ᵉ segment a été abandonné pour porter le marqueur BC
 
-**Cause, confirmée dans le code source de l'action Microsoft** (`IncrementVersionNumber.psm1`, fonction `Set-VersionInSettingsFile`) :
+Première approche (essayée puis abandonnée) : préserver le marqueur BC sur le **4ᵉ segment** (`Revision`) à travers les incréments `IncrementVersionNumber`. Ça fonctionnait pour le fichier **committé dans git**, mais s'est révélé inutile en pratique : **le `.app` réellement compilé ne le conserve jamais**, quel que soit le réglage.
+
+Confirmé dans le code source de BcContainerHelper (`Run-AlPipeline.ps1`), exécuté juste avant la compilation, sur la copie de travail du runner (jamais sur le repo git) :
 ```powershell
-# Include revision number if it exist in the old version number
-if ($oldVersion -and ($oldVersion.Revision -ne -1)) {
-    $versionNumbers += 0 # Always set the revision number to 0
+if ($appBuild -eq -1) {
+    $version = [System.Version]::new($appJsonVersion.Major, $appJsonVersion.Minor, $appJsonVersion.Build, $appRevision)
 }
 ```
-Ce n'est pas conditionné par le type d'incrément (`+1`, `+0.1`, `+0.0.1`, ou une valeur absolue) ni par `versioningStrategy` — l'action Microsoft remet **toujours** le 4ᵉ segment à `0`, sans exception possible via un réglage existant. C'est une incompatibilité structurelle entre cet outil natif d'AL-Go (4ᵉ segment = numéro de révision technique) et la convention de version de SB Consulting (4ᵉ segment = marqueur BC, une information métier persistante).
+`$appRevision` est **toujours** calculé comme `runNumberOffset + GITHUB_RUN_NUMBER` (numéro de run GitHub), jamais dérivé de ce qui est committé — et il n'existe **aucun réglage** dans `settings.schema.json` pour désactiver cet écrasement. Par contre, ce même code montre que le **3ᵉ segment (`Build`)** est repris tel quel depuis `app.json` committé (`$appJsonVersion.Build`) quand `versioningStrategy` a ses 4 bits de poids faible à `3` (`appBuild -eq -1`) — **celui-là survit à la compilation**.
+
+### Le nouveau design : marqueur + compteur dans le 3ᵉ segment
+
+Le 3ᵉ segment encode maintenant `<marqueur BC 2 chiffres><compteur 3 chiffres>` — ex. `28001` = BC 28, build 1. Le 4ᵉ segment redevient simplement le numéro de build interne d'AL-Go, sans qu'on lutte contre lui.
+
+- Un incrément `+0.0.1` (utilisé par `Auto Increment On CICD`) fait déjà `Build = Build + 1` nativement dans AL-Go (`28001 → 28002`) — le préfixe survit **sans code custom**, tant qu'on ne dépasse pas 999 builds sous le même marqueur.
+- Un incrément `+0.1` (CU) ou `+1` (majeur), ou une valeur absolue, remet `Build` à `0` dans l'action Microsoft (`Set-VersionInSettingsFile`) — cassant le préfixe. C'est ce que corrige `versionBCPreserve`.
+- **Porter vers une nouvelle version BC** est un geste manuel : changer `versionBCMarker` dans `settings.json` — le compteur repart à zéro sous ce nouveau marqueur au prochain incrément.
 
 ### Comment ça marche
 
-`.github/workflows/IncrementVersionNumber.yaml` (fichier de ce repo, pas une action externe fermée) a été complété avec deux étapes autour de l'étape standard `Increment Version Number`, actives uniquement si `versionBCPreserve: true` dans `.AL-Go/settings.json` :
+`.github/workflows/IncrementVersionNumber.yaml` (fichier de ce repo, pas une action externe fermée) a une étape `Fix BC version marker` après l'étape standard `Increment Version Number`, active uniquement si `versionBCPreserve: true` **et** `versionBCMarker` renseigné dans `.AL-Go/settings.json`. Contrairement à l'ancienne version (capturer avant / restaurer après), celle-ci est **sans état** : elle vérifie juste, après coup, si le préfixe du 3ᵉ segment correspond à `versionBCMarker` et le corrige si besoin — peu importe quel type d'incrément (`+1`, `+0.1`, `+0.0.1`, absolu) a causé l'écart. Elle corrige à la fois `repoVersion` (dans `settings.json`) et le `version` de **tous** les `app.json` du repo (principal, test, BCPT), puisque les deux doivent rester cohérents (voir section suivante).
 
-1. **`Capture BC version segment`** (avant) : lit le 4ᵉ segment actuel de **tous** les `app.json` du repo (principal, test, BCPT), les mémorise dans un fichier temporaire.
-2. L'étape standard Microsoft tourne normalement (et remet chaque 4ᵉ segment à `0`, comme toujours).
-3. **`Restore BC version segment`** (après, uniquement si `directCommit: true`) : récupère le commit que l'étape précédente vient de pousser, remet le 4ᵉ segment de chaque `app.json` à la valeur mémorisée à l'étape 1, et commit ce correctif séparément.
-
-**⚠️ Bug trouvé et corrigé (16/09/2026)** : la première version de l'étape 3 réécrivait tout le fichier via `ConvertTo-Json` — ce qui réindente/reformate **tout** `app.json`, pas seulement la valeur `version` (confirmé : un `app.json` entier s'est retrouvé réindenté après un run réel). Corrigé par un remplacement ciblé du seul champ `"version"` dans le texte brut du fichier (regex sur `"version"(\s*:\s*)"<ancienne valeur>"`), qui laisse chaque autre ligne strictement inchangée.
-
-Résultat : **deux commits** par incrément (celui de l'action Microsoft, puis notre correctif) au lieu d'un seul — accepté comme compromis pour ne pas avoir à réimplémenter toute la logique de l'action (résolution des projets, synchro des dépendances entre apps, gestion de `repoVersion`).
+Remplacement ciblé du seul champ concerné dans le texte brut du fichier (regex sur `"<champ>"(\s*:\s*)"<ancienne valeur>"`) — jamais un `ConvertTo-Json` sur l'objet entier, qui réindenterait tout le fichier (bug rencontré et corrigé sur l'ancienne version de ce mécanisme).
 
 ### Pourquoi ça ne déclenche pas les automatisations deux fois
 
 Le commit correctif utilise **toujours** le `GITHUB_TOKEN` par défaut du job (jamais le PAT `GHTOKENWORKFLOW`), quel que soit le réglage `useGhTokenWorkflow` passé pour l'incrément lui-même. Comme confirmé plus haut, un push fait avec `GITHUB_TOKEN` ne déclenche jamais de workflow `on: push` — donc ni la CI/CD, ni `Auto Increment On CICD` ne se redéclenchent à cause de ce commit, exactement comme le premier commit de l'action Microsoft.
 
-### Réglage
+### `repoVersion` aligné sur `app.json` — le bit 16 de `versioningStrategy`
+
+Exigence : `repoVersion` doit porter le même nom/tag que la version de l'app (sauf en multi-projets, où chaque projet a son propre `settings.json` et peut activer ce bit indépendamment — rien de spécial à faire). Le seul mécanisme standard (sans code custom) pour ça est le bit `16` de `versioningStrategy` (`useRepoVersion`), confirmé dans `Set-VersionInAppManifests` :
+```powershell
+$useRepoVersion = (($projectSettings.versioningStrategy -band 16) -eq 16)
+if ($useRepoVersion) {
+    $newValue = $projectSettings.repoVersion
+}
+```
+Quand ce bit est actif, AL-Go force **chaque** `app.json` du projet à prendre la valeur de `repoVersion` à chaque incrément. D'où `versioningStrategy: 19` (`3 + 16`) au lieu de `3` seul — garde la syntaxe `+0.0.1` **et** active la synchronisation.
+
+`repoVersion` reste volontairement à **3 segments** (`Major.Minor.Build`, sans 4ᵉ) — pas besoin de l'aligner à 4 segments pour que ça marche : quand AL-Go propage une valeur absolue à 3 segments vers un `app.json` qui en a déjà 4, il rajoute automatiquement un `0` en 4ᵉ position (`if ($oldVersion.Revision -ne -1) { $versionNumbers += 0 }`, même fonction). Le 4ᵉ segment ne porte de toute façon aucune information puisqu'il est toujours écrasé à la compilation.
+
+### Réglages
 
 ```json
-"versionBCPreserve": true
+"versioningStrategy": 19,
+"versionBCPreserve": true,
+"versionBCMarker": 28
 ```
 
-- `false` par défaut (absent = désactivé) — rien ne change tant que ce n'est pas activé explicitement.
-- **Volontairement indépendant de `versioningStrategy`** — ce dernier reste un réglage propre à Microsoft (contrôle les syntaxes d'incrément autorisées par l'action), sans lien numérique avec notre propre logique de préservation. Coupler les deux aurait été fragile : si Microsoft change un jour le sens de `versioningStrategy`, notre fonctionnalité se serait arrêtée de fonctionner silencieusement, sans rapport apparent.
+- `versionBCPreserve` : `false` par défaut (absent = désactivé) — rien de custom ne s'exécute, comportement 100% standard AL-Go.
+- `versionBCMarker` : `0` ou absent désactive aussi la correction (traité comme "pas de marqueur à appliquer"), même si `versionBCPreserve` est à `true`.
+- **Volontairement indépendant de la valeur exacte de `versioningStrategy`** (au-delà du bit 16 nécessaire pour `repoVersion`) — coupler notre logique à un nombre précis aurait été fragile si Microsoft change un jour le sens de ce réglage.
 
-**✅ Validé en conditions réelles (16/09/2026)** sur `main` et `OnPrem` — les deux bugs ci-dessus (réindentation, et le tag SemVer plus haut) ont été trouvés et corrigés grâce à ce test.
+**⚠️ Non testé en conditions réelles au moment de l'écriture** (refonte du 16/09/2026) — la version précédente (préservation du 4ᵉ segment) avait été validée en conditions réelles, mais cette nouvelle approche (marqueur+compteur sur le 3ᵉ segment, plus la synchro `repoVersion`) n'a pas encore été exercée par un vrai run. À valider au prochain incrément réel.

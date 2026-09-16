@@ -81,45 +81,6 @@ jobs:
           getSecrets: 'TokenForPush'
           useGhTokenWorkflowForPush: '${{ github.event.inputs.useGhTokenWorkflow }}'
 
-      - name: Capture BC version segment
-        run: |
-          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
-
-          # AL-Go-Actions/IncrementVersionNumber always resets app.json's 4th segment
-          # (Revision) to 0 on every increment - confirmed from its source
-          # (Set-VersionInSettingsFile: "# Always set the revision number to 0", no
-          # condition on increment type). SB Consulting uses that segment as a manually-set
-          # BC-compatibility marker that must survive ordinary increments untouched, so when
-          # "versionBCPreserve" is enabled, capture every app.json's current Revision here,
-          # before the increment runs, to restore it afterwards. Independent of
-          # versioningStrategy - that setting only controls which increment syntaxes AL-Go's
-          # own action allows, not this repo-specific behavior.
-          $settings = $env:Settings | ConvertFrom-Json
-          $preserve = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty versionBCPreserve
-          $captureFile = Join-Path $env:RUNNER_TEMP "bcVersionSegments.json"
-
-          if (-not $preserve) {
-              Write-Host "versionBCPreserve is not enabled, nothing to capture."
-              "{}" | Set-Content -Path $captureFile
-              exit 0
-          }
-
-          $appJsonFiles = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
-              Where-Object { $_.FullName -notmatch '\\\.(altemplates|dependencies|alpackages)\\' }
-
-          $map = @{}
-          foreach ($file in $appJsonFiles) {
-              $appJson = Get-Content $file.FullName -Raw | ConvertFrom-Json
-              try {
-                  $version = [System.Version]$appJson.version
-                  $map[$file.FullName] = $version.Revision
-              } catch {
-                  Write-Host "Skipping $($file.FullName) - version '$($appJson.version)' is not a valid version string."
-              }
-          }
-          $map | ConvertTo-Json | Set-Content -Path $captureFile
-          Write-Host "Captured BC version segment for $($map.Count) app.json file(s)."
-
       - name: Increment Version Number
         uses: microsoft/AL-Go-Actions/IncrementVersionNumber@v9.2
         with:
@@ -130,51 +91,81 @@ jobs:
           skipUpdatingDependencies: ${{ github.event.inputs.skipUpdatingDependencies }}
           directCommit: ${{ github.event.inputs.directCommit }}
 
-      - name: Restore BC version segment
+      - name: Fix BC version marker
         if: ${{ github.event.inputs.directCommit == 'true' }}
         run: |
           $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
 
+          # AL-Go-Actions/IncrementVersionNumber resets app.json's 3rd segment (Build) to 0
+          # on a +0.1/+1/absolute increment (confirmed from Set-VersionInSettingsFile's source),
+          # and the compiled .app's 4th segment (Revision) is unconditionally overwritten at
+          # compile time by BcContainerHelper regardless of what's committed (confirmed from
+          # Run-AlPipeline.ps1 - no setting disables this). So SB Consulting encodes the BC
+          # marker in the *high* digits of the 3rd segment instead (<marker>*1000 + counter,
+          # e.g. 28001 = BC 28, build 1), and lets the 4th segment be whatever AL-Go/BcContainer-
+          # Helper wants it to be. A plain "+0.0.1" increment already does Build+1 natively,
+          # which keeps the marker prefix intact on its own; this step is the safety net for
+          # the cases that don't (+0.1, +1, absolute versionNumber) - stateless: it just checks
+          # whether the current prefix matches versionBCMarker and fixes it if not, so it
+          # doesn't matter which increment type caused the mismatch. Independent of
+          # versioningStrategy - that setting only controls which increment syntaxes AL-Go's
+          # own action allows, not this repo-specific behavior.
           $settings = $env:Settings | ConvertFrom-Json
           $preserve = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty versionBCPreserve
-          if (-not $preserve) {
-              Write-Host "versionBCPreserve is not enabled, nothing to restore."
+          $bcMarker = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty versionBCMarker
+          if ((-not $preserve) -or (-not $bcMarker)) {
+              Write-Host "versionBCPreserve/versionBCMarker not enabled, nothing to fix."
               exit 0
           }
-
-          $captureFile = Join-Path $env:RUNNER_TEMP "bcVersionSegments.json"
-          $map = Get-Content $captureFile -Raw | ConvertFrom-Json
 
           # Pick up the commit the increment step just pushed with directCommit: true.
           git fetch origin
           git reset --hard "origin/$($env:GITHUB_REF_NAME)"
 
-          $changed = $false
-          foreach ($property in $map.PSObject.Properties) {
-              $path = $property.Name
-              $originalRevision = $property.Value
-              if (-not (Test-Path $path)) {
-                  continue
-              }
+          function Fix-BCMarker($path, $fieldName) {
               $rawContent = Get-Content $path -Raw
-              $appJson = $rawContent | ConvertFrom-Json
-              $version = [System.Version]$appJson.version
-              if ($version.Revision -ne $originalRevision) {
-                  $oldVersionStr = $appJson.version
-                  $newVersion = "$($version.Major).$($version.Minor).$($version.Build).$originalRevision"
-                  Write-Host "Restoring BC version segment in $path : $oldVersionStr -> $newVersion"
-                  # Targeted text replace of just the version value - NOT ConvertTo-Json on the
-                  # whole object, which reformats/reindents the entire file (confirmed on a real
-                  # run: the whole app.json came out reindented). This keeps every other line
-                  # byte-for-byte untouched.
-                  $pattern = '"version"(\s*:\s*)"' + [regex]::Escape($oldVersionStr) + '"'
-                  if ($rawContent -notmatch $pattern) {
-                      throw "Could not find the exact 'version' field ('$oldVersionStr') to restore in $path - refusing to guess and risk corrupting the file."
-                  }
-                  $newContent = $rawContent -replace $pattern, ('"version"$1"' + $newVersion + '"')
-                  Set-Content -Path $path -Value $newContent -NoNewline -Encoding UTF8
-                  $changed = $true
+              $json = $rawContent | ConvertFrom-Json
+              $valueStr = $json.$fieldName
+              try {
+                  $version = [System.Version]$valueStr
+              } catch {
+                  return $false
               }
+              if ($version.Build -eq -1) {
+                  return $false
+              }
+              $currentPrefix = [Math]::Floor($version.Build / 1000)
+              if ($currentPrefix -eq $bcMarker) {
+                  return $false
+              }
+              $counter = $version.Build % 1000
+              $newBuild = ($bcMarker * 1000) + $counter
+              if ($version.Revision -ne -1) {
+                  $newVersion = "$($version.Major).$($version.Minor).$newBuild.$($version.Revision)"
+              } else {
+                  $newVersion = "$($version.Major).$($version.Minor).$newBuild"
+              }
+              Write-Host "Fixing BC marker in $path : $valueStr -> $newVersion"
+              # Targeted text replace of just this field's value - NOT ConvertTo-Json on the
+              # whole object, which reformats/reindents the entire file (confirmed on a real
+              # run: the whole app.json came out reindented). This keeps every other line
+              # byte-for-byte untouched.
+              $pattern = '"' + [regex]::Escape($fieldName) + '"(\s*:\s*)"' + [regex]::Escape($valueStr) + '"'
+              if ($rawContent -notmatch $pattern) {
+                  throw "Could not find the exact '$fieldName' field ('$valueStr') to fix in $path - refusing to guess and risk corrupting the file."
+              }
+              $newContent = $rawContent -replace $pattern, ('"' + $fieldName + '"$1"' + $newVersion + '"')
+              Set-Content -Path $path -Value $newContent -NoNewline -Encoding UTF8
+              return $true
+          }
+
+          $changed = $false
+          if (Fix-BCMarker ".AL-Go/settings.json" "repoVersion") { $changed = $true }
+
+          $appJsonFiles = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
+              Where-Object { $_.FullName -notmatch '\\\.(altemplates|dependencies|alpackages)\\' }
+          foreach ($file in $appJsonFiles) {
+              if (Fix-BCMarker $file.FullName "version") { $changed = $true }
           }
 
           if ($changed) {
@@ -185,10 +176,10 @@ jobs:
               git config user.name "github-actions[bot]"
               git config user.email "github-actions[bot]@users.noreply.github.com"
               git add -A
-              git commit -m "Restore BC version segment after increment"
+              git commit -m "Fix BC version marker after increment"
               git push origin "HEAD:$($env:GITHUB_REF_NAME)"
           } else {
-              Write-Host "Nothing to restore - no app.json's BC version segment changed."
+              Write-Host "Nothing to fix - BC version marker already correct everywhere."
           }
 
       - name: Finalize the workflow
