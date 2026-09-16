@@ -175,3 +175,41 @@ Le garde-fou applicatif (vérifier `github.event.workflow_run.head_commit.messag
 ### ⚠️ Point de vigilance majeur
 
 Une fois `enabled: true` (sur `Auto Release On Merge` et/ou `Auto Increment On CICD`), des commits/releases/déploiements automatiques peuvent se produire sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
+
+## Réglage `versionBCPreserve` — préserver le 4ᵉ segment (marqueur BC) à travers les incréments (ajouté le 16/09/2026)
+
+**Constaté en conditions réelles** : un incrément manuel du 4ᵉ segment de `app.json` (ex. mettre `.280` pour marquer la compatibilité avec BC 28 CU 0) est **écrasé et remis à `0`** dès le prochain passage de `Auto Release On Merge` ou `Auto Increment On CICD`.
+
+**Cause, confirmée dans le code source de l'action Microsoft** (`IncrementVersionNumber.psm1`, fonction `Set-VersionInSettingsFile`) :
+```powershell
+# Include revision number if it exist in the old version number
+if ($oldVersion -and ($oldVersion.Revision -ne -1)) {
+    $versionNumbers += 0 # Always set the revision number to 0
+}
+```
+Ce n'est pas conditionné par le type d'incrément (`+1`, `+0.1`, `+0.0.1`, ou une valeur absolue) ni par `versioningStrategy` — l'action Microsoft remet **toujours** le 4ᵉ segment à `0`, sans exception possible via un réglage existant. C'est une incompatibilité structurelle entre cet outil natif d'AL-Go (4ᵉ segment = numéro de révision technique) et la convention de version de SB Consulting (4ᵉ segment = marqueur BC, une information métier persistante).
+
+### Comment ça marche
+
+`.github/workflows/IncrementVersionNumber.yaml` (fichier de ce repo, pas une action externe fermée) a été complété avec deux étapes autour de l'étape standard `Increment Version Number`, actives uniquement si `versionBCPreserve: true` dans `.AL-Go/settings.json` :
+
+1. **`Capture BC version segment`** (avant) : lit le 4ᵉ segment actuel de **tous** les `app.json` du repo (principal, test, BCPT), les mémorise dans un fichier temporaire.
+2. L'étape standard Microsoft tourne normalement (et remet chaque 4ᵉ segment à `0`, comme toujours).
+3. **`Restore BC version segment`** (après, uniquement si `directCommit: true`) : récupère le commit que l'étape précédente vient de pousser, remet le 4ᵉ segment de chaque `app.json` à la valeur mémorisée à l'étape 1, et commit ce correctif séparément.
+
+Résultat : **deux commits** par incrément (celui de l'action Microsoft, puis notre correctif) au lieu d'un seul — accepté comme compromis pour ne pas avoir à réimplémenter toute la logique de l'action (résolution des projets, synchro des dépendances entre apps, gestion de `repoVersion`).
+
+### Pourquoi ça ne déclenche pas les automatisations deux fois
+
+Le commit correctif utilise **toujours** le `GITHUB_TOKEN` par défaut du job (jamais le PAT `GHTOKENWORKFLOW`), quel que soit le réglage `useGhTokenWorkflow` passé pour l'incrément lui-même. Comme confirmé plus haut, un push fait avec `GITHUB_TOKEN` ne déclenche jamais de workflow `on: push` — donc ni la CI/CD, ni `Auto Increment On CICD` ne se redéclenchent à cause de ce commit, exactement comme le premier commit de l'action Microsoft.
+
+### Réglage
+
+```json
+"versionBCPreserve": true
+```
+
+- `false` par défaut (absent = désactivé) — rien ne change tant que ce n'est pas activé explicitement.
+- **Volontairement indépendant de `versioningStrategy`** — ce dernier reste un réglage propre à Microsoft (contrôle les syntaxes d'incrément autorisées par l'action), sans lien numérique avec notre propre logique de préservation. Coupler les deux aurait été fragile : si Microsoft change un jour le sens de `versioningStrategy`, notre fonctionnalité se serait arrêtée de fonctionner silencieusement, sans rapport apparent.
+
+**⚠️ Non testé en conditions réelles au moment de l'écriture** — comme le reste de cette série de fonctionnalités, à valider au premier run réel avec `versionBCPreserve: true`.

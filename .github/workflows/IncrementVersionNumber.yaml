@@ -81,6 +81,45 @@ jobs:
           getSecrets: 'TokenForPush'
           useGhTokenWorkflowForPush: '${{ github.event.inputs.useGhTokenWorkflow }}'
 
+      - name: Capture BC version segment
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          # AL-Go-Actions/IncrementVersionNumber always resets app.json's 4th segment
+          # (Revision) to 0 on every increment - confirmed from its source
+          # (Set-VersionInSettingsFile: "# Always set the revision number to 0", no
+          # condition on increment type). SB Consulting uses that segment as a manually-set
+          # BC-compatibility marker that must survive ordinary increments untouched, so when
+          # "versionBCPreserve" is enabled, capture every app.json's current Revision here,
+          # before the increment runs, to restore it afterwards. Independent of
+          # versioningStrategy - that setting only controls which increment syntaxes AL-Go's
+          # own action allows, not this repo-specific behavior.
+          $settings = $env:Settings | ConvertFrom-Json
+          $preserve = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty versionBCPreserve
+          $captureFile = Join-Path $env:RUNNER_TEMP "bcVersionSegments.json"
+
+          if (-not $preserve) {
+              Write-Host "versionBCPreserve is not enabled, nothing to capture."
+              "{}" | Set-Content -Path $captureFile
+              exit 0
+          }
+
+          $appJsonFiles = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
+              Where-Object { $_.FullName -notmatch '\\\.(altemplates|dependencies|alpackages)\\' }
+
+          $map = @{}
+          foreach ($file in $appJsonFiles) {
+              $appJson = Get-Content $file.FullName -Raw | ConvertFrom-Json
+              try {
+                  $version = [System.Version]$appJson.version
+                  $map[$file.FullName] = $version.Revision
+              } catch {
+                  Write-Host "Skipping $($file.FullName) - version '$($appJson.version)' is not a valid version string."
+              }
+          }
+          $map | ConvertTo-Json | Set-Content -Path $captureFile
+          Write-Host "Captured BC version segment for $($map.Count) app.json file(s)."
+
       - name: Increment Version Number
         uses: microsoft/AL-Go-Actions/IncrementVersionNumber@v9.2
         with:
@@ -90,6 +129,57 @@ jobs:
           versionNumber: ${{ github.event.inputs.versionNumber }}
           skipUpdatingDependencies: ${{ github.event.inputs.skipUpdatingDependencies }}
           directCommit: ${{ github.event.inputs.directCommit }}
+
+      - name: Restore BC version segment
+        if: ${{ github.event.inputs.directCommit == 'true' }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          $settings = $env:Settings | ConvertFrom-Json
+          $preserve = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty versionBCPreserve
+          if (-not $preserve) {
+              Write-Host "versionBCPreserve is not enabled, nothing to restore."
+              exit 0
+          }
+
+          $captureFile = Join-Path $env:RUNNER_TEMP "bcVersionSegments.json"
+          $map = Get-Content $captureFile -Raw | ConvertFrom-Json
+
+          # Pick up the commit the increment step just pushed with directCommit: true.
+          git fetch origin
+          git reset --hard "origin/$($env:GITHUB_REF_NAME)"
+
+          $changed = $false
+          foreach ($property in $map.PSObject.Properties) {
+              $path = $property.Name
+              $originalRevision = $property.Value
+              if (-not (Test-Path $path)) {
+                  continue
+              }
+              $appJson = Get-Content $path -Raw | ConvertFrom-Json
+              $version = [System.Version]$appJson.version
+              if ($version.Revision -ne $originalRevision) {
+                  $newVersion = "$($version.Major).$($version.Minor).$($version.Build).$originalRevision"
+                  Write-Host "Restoring BC version segment in $path : $($appJson.version) -> $newVersion"
+                  $appJson.version = $newVersion
+                  $appJson | ConvertTo-Json -Depth 20 | Set-Content -Path $path -Encoding UTF8
+                  $changed = $true
+              }
+          }
+
+          if ($changed) {
+              # Always the default GITHUB_TOKEN, never the ghTokenWorkflow PAT - a push made
+              # with GITHUB_TOKEN never triggers "on: push" workflows (confirmed on this repo),
+              # so this correction commit stays invisible to CI/CD and everything downstream
+              # of it, regardless of what useGhTokenWorkflow was passed for the increment itself.
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add -A
+              git commit -m "Restore BC version segment after increment"
+              git push origin "HEAD:$($env:GITHUB_REF_NAME)"
+          } else {
+              Write-Host "Nothing to restore - no app.json's BC version segment changed."
+          }
 
       - name: Finalize the workflow
         if: always()
