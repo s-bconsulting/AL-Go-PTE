@@ -13,6 +13,16 @@ on:
     workflows: [ 'CI/CD' ]
     types: [ completed ]
 
+# Confirmed on a real run (16/09/2026): GitHub delivered the SAME CI/CD completion 3 times about
+# 18 minutes apart (likely tied to self-hosted runner queue latency), firing this workflow 3
+# times for one underlying event and tripling the version increment. All 3 evaluated the branch
+# state before any of them had pushed a commit, so a same-branch concurrency group is needed to
+# serialize them (queued, not cancelled - a duplicate must still be skipped cleanly, not just
+# dropped) rather than letting them race in parallel.
+concurrency:
+  group: auto-increment-on-cicd-${{ github.event.workflow_run.head_branch }}
+  cancel-in-progress: false
+
 permissions:
   # actions: write is required by "gh workflow run" (creating a workflow_dispatch event) -
   # confirmed via a real 403 "Resource not accessible by integration" with actions: read alone.
@@ -42,6 +52,8 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           HeadBranch: ${{ github.event.workflow_run.head_branch }}
+          TriggerHeadSha: ${{ github.event.workflow_run.head_sha }}
+          Repository: ${{ github.repository }}
           # workflow_run's head_commit.message is the exact commit message of the run's HEAD.
           # AL-Go-Actions/IncrementVersionNumber always commits as either
           # "Incremented Version number by <value>" (incremental) or "New Version number <value>"
@@ -79,6 +91,17 @@ jobs:
               exit 0
           }
 
+          # Duplicate-delivery guard: confirmed on a real run that GitHub can fire this workflow
+          # multiple times for the SAME CI/CD completion (3x here, ~18 min apart). The
+          # concurrency group above serializes these, but only the *dispatch-and-wait* below
+          # actually makes that useful - if a queued duplicate's branch no longer matches the
+          # commit it originally reacted to, an earlier duplicate already handled it.
+          $currentSha = gh api "repos/$($env:Repository)/branches/$($env:HeadBranch)" --jq '.commit.sha'
+          if ($currentSha -ne $env:TriggerHeadSha) {
+              Write-Host "Branch '$($env:HeadBranch)' HEAD ($currentSha) no longer matches the commit this run reacted to ($($env:TriggerHeadSha)) - a duplicate delivery of this same CI/CD success already handled it. Skipping."
+              exit 0
+          }
+
           $versionIncrement = if ($auto.versionIncrement) { $auto.versionIncrement } else { '+0.0.1' }
 
           Write-Host "Incrementing version by '$versionIncrement' on '$($env:HeadBranch)'"
@@ -86,3 +109,27 @@ jobs:
               --ref $env:HeadBranch `
               -f versionNumber=$versionIncrement `
               -f directCommit=true
+
+          # Wait for it to finish before this job ends. Combined with the concurrency group
+          # above, this is what makes the duplicate-delivery guard effective: a queued duplicate
+          # only starts checking branch state after this one's dispatched run (and its own "Fix
+          # BC version marker" commit) has actually landed, so it correctly sees the branch has
+          # moved and skips, instead of racing to dispatch its own duplicate increment.
+          $timeoutMinutes = 20
+          $pollSeconds = 15
+          $deadline = (Get-Date).AddMinutes($timeoutMinutes)
+          $dispatchedAt = Get-Date
+          $run = $null
+          while ((Get-Date) -lt $deadline) {
+              Start-Sleep -Seconds $pollSeconds
+              $runs = gh run list --workflow "IncrementVersionNumber.yaml" --branch $env:HeadBranch --json databaseId,status,createdAt --limit 10 | ConvertFrom-Json
+              $run = $runs | Where-Object { [DateTime]$_.createdAt -ge $dispatchedAt.AddSeconds(-10) } | Sort-Object createdAt | Select-Object -First 1
+              if ($run -and $run.status -eq 'completed') {
+                  break
+              }
+          }
+          if ($run -and $run.status -eq 'completed') {
+              Write-Host "IncrementVersionNumber run $($run.databaseId) completed."
+          } else {
+              Write-Host "::warning::Timed out waiting for the dispatched IncrementVersionNumber run to complete - a duplicate delivery arriving after this point may not be caught by the guard above."
+          }

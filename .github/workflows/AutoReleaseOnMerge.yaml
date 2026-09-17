@@ -15,6 +15,15 @@ on:
   pull_request:
     types: [ closed ]
 
+# A duplicate delivery of the same PR-closed event would still be caught correctly by the
+# existing "does a release for this tag already exist" guard further down (the second one just
+# skips) - but without this, both would independently run the full 90-minute CI/CD-wait poll in
+# parallel first, wasting a runner slot for nothing. Confirmed elsewhere (AutoIncrementOnCICD.yaml,
+# 16/09/2026) that GitHub can redeliver the same event multiple times, so this is cheap insurance.
+concurrency:
+  group: auto-release-on-merge-${{ github.event.pull_request.number }}-${{ github.event.pull_request.merge_commit_sha }}
+  cancel-in-progress: false
+
 permissions:
   # actions: write is required by "gh workflow run" (creating a workflow_dispatch event) -
   # confirmed via a real 403 "Resource not accessible by integration" on AutoIncrementOnCICD.yaml
@@ -101,11 +110,11 @@ jobs:
           }
           Write-Host "CI/CD run $($run.databaseId) succeeded on merge commit $($env:MergeSha). Proceeding."
 
-          # Derive the release tag from the main app's version in app.json, verbatim (all 4
-          # segments, unchanged) - do NOT collapse it to a 3-segment "Major.Minor.0" shape.
-          # Unlike a generic build/revision counter, every segment here can carry real meaning
-          # (e.g. a product major/CU/fix scheme plus a manually-set BC-compatibility marker) -
-          # rewriting the version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
+          # Derive the release tag from the main app's version in app.json, preserving all 4
+          # segments - do NOT collapse it to a 3-segment "Major.Minor.0" shape. Unlike a generic
+          # build/revision counter, every segment here can carry real meaning (e.g. a product
+          # major/CU/fix scheme plus a manually-set BC-compatibility marker) - rewriting the
+          # version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
           # Heuristic: first app.json found, excluding folders that look like test/performance apps.
           # If your repo layout doesn't match this assumption, adjust this section.
           $appJsonFile = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
@@ -118,18 +127,33 @@ jobs:
 
           $appJson = Get-Content $appJsonFile.FullName -Raw | ConvertFrom-Json
           try {
-              [void][System.Version]$appJson.version
+              $version = [System.Version]$appJson.version
           } catch {
               throw "app.json version '$($appJson.version)' in $($appJsonFile.FullName) is not a valid version string."
           }
-          $tag = $appJson.version
+          # A plain 4-segment tag (e.g. "1.9.2.0") is NOT valid SemVer and breaks CreateReleaseNotes
+          # ("'1.9.2.0' cannot be recognized as a semantic version string") - confirmed on a real
+          # run, from AL-Go-Actions/Github-Helper.psm1's SemVerStrToSemVerObj, which parses only
+          # Major.Minor.Patch then, optionally, "-<additional segments separated by '.'>". Putting
+          # the 4th segment after a dash keeps it fully valid SemVer while still preserving it
+          # losslessly (e.g. "1.9.2-0" instead of "1.9.2.0").
+          $tag = "$($version.Major).$($version.Minor).$($version.Build)-$($version.Revision)"
           Write-Host "Derived tag '$tag' from $($appJsonFile.FullName)"
 
           # If app.json's version hasn't changed since the last release, this merge didn't bump
           # it (e.g. no version-bump policy was applied in the PR) - skip rather than fail on a
           # duplicate tag.
+          # "gh release view" writes to stderr and exits non-zero when the tag doesn't exist yet -
+          # the expected, common case here. Under $ErrorActionPreference = "Stop", Windows
+          # PowerShell 5.1 turns that stderr write into a terminating NativeCommandError even with
+          # 2>$null redirection - confirmed by a real run crashing here on a brand new tag.
+          # Temporarily relax it so $LASTEXITCODE can actually be checked.
+          $previousEAP = $errorActionPreference
+          $errorActionPreference = "SilentlyContinue"
           gh release view $tag --json tagName 1>$null 2>$null
-          if ($LASTEXITCODE -eq 0) {
+          $releaseAlreadyExists = ($LASTEXITCODE -eq 0)
+          $errorActionPreference = $previousEAP
+          if ($releaseAlreadyExists) {
               Write-Host "A release tagged '$tag' already exists - app.json version wasn't bumped since the last release. Nothing to do."
               exit 0
           }

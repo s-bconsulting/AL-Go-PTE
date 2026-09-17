@@ -91,6 +91,131 @@ jobs:
           skipUpdatingDependencies: ${{ github.event.inputs.skipUpdatingDependencies }}
           directCommit: ${{ github.event.inputs.directCommit }}
 
+      - name: Fix BC version marker
+        if: ${{ github.event.inputs.directCommit == 'true' }}
+        run: |
+          $errorActionPreference = "Stop"; $ProgressPreference = "SilentlyContinue"; Set-StrictMode -Version 2.0
+
+          # AL-Go-Actions/IncrementVersionNumber resets app.json's 3rd segment (Build) to 0
+          # on a +0.1/+1/absolute increment (confirmed from Set-VersionInSettingsFile's source),
+          # and the compiled .app's 4th segment (Revision) is unconditionally overwritten at
+          # compile time by BcContainerHelper regardless of what's committed (confirmed from
+          # Run-AlPipeline.ps1 - no setting disables this). So SB Consulting encodes the BC
+          # marker in the *high* digits of the 3rd segment instead (<marker>*1000 + counter,
+          # e.g. 28001 = BC 28, build 1), and lets the 4th segment be whatever AL-Go/BcContainer-
+          # Helper wants it to be. A plain "+0.0.1" increment already does Build+1 natively,
+          # which keeps the marker prefix intact on its own; this step is the safety net for
+          # the cases that don't (+0.1, +1, absolute versionNumber) - stateless: it just checks
+          # whether the current prefix matches versionBCMarker and fixes it if not, so it
+          # doesn't matter which increment type caused the mismatch. Independent of
+          # versioningStrategy - that setting only controls which increment syntaxes AL-Go's
+          # own action allows, not this repo-specific behavior.
+          #
+          # This step also force-syncs repoVersion to match the main app's Major.Minor.Build.
+          # AL-Go's own versioningStrategy bit 16 (useRepoVersion) is documented to do this
+          # natively, but a real test showed it does NOT reliably keep app.json and repoVersion
+          # in sync (each drifted independently after a manual app.json edit broke the initial
+          # alignment) - so this repo does the sync itself instead of relying on that bit.
+          $settings = $env:Settings | ConvertFrom-Json
+          $preserve = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty versionBCPreserve
+          $bcMarker = $settings | Select-Object -ErrorAction SilentlyContinue -ExpandProperty versionBCMarker
+          if ((-not $preserve) -or (-not $bcMarker)) {
+              Write-Host "versionBCPreserve/versionBCMarker not enabled, nothing to fix."
+              exit 0
+          }
+
+          # Pick up the commit the increment step just pushed with directCommit: true.
+          git fetch origin
+          git reset --hard "origin/$($env:GITHUB_REF_NAME)"
+
+          function Fix-BCMarker($path, $fieldName) {
+              $rawContent = Get-Content $path -Raw
+              $json = $rawContent | ConvertFrom-Json
+              $valueStr = $json.$fieldName
+              try {
+                  $version = [System.Version]$valueStr
+              } catch {
+                  return $false
+              }
+              if ($version.Build -eq -1) {
+                  return $false
+              }
+              $currentPrefix = [Math]::Floor($version.Build / 1000)
+              if ($currentPrefix -eq $bcMarker) {
+                  return $false
+              }
+              $counter = $version.Build % 1000
+              $newBuild = ($bcMarker * 1000) + $counter
+              if ($version.Revision -ne -1) {
+                  $newVersion = "$($version.Major).$($version.Minor).$newBuild.$($version.Revision)"
+              } else {
+                  $newVersion = "$($version.Major).$($version.Minor).$newBuild"
+              }
+              Write-Host "Fixing BC marker in $path : $valueStr -> $newVersion"
+              # Targeted text replace of just this field's value - NOT ConvertTo-Json on the
+              # whole object, which reformats/reindents the entire file (confirmed on a real
+              # run: the whole app.json came out reindented). This keeps every other line
+              # byte-for-byte untouched.
+              $pattern = '"' + [regex]::Escape($fieldName) + '"(\s*:\s*)"' + [regex]::Escape($valueStr) + '"'
+              if ($rawContent -notmatch $pattern) {
+                  throw "Could not find the exact '$fieldName' field ('$valueStr') to fix in $path - refusing to guess and risk corrupting the file."
+              }
+              $newContent = $rawContent -replace $pattern, ('"' + $fieldName + '"$1"' + $newVersion + '"')
+              Set-Content -Path $path -Value $newContent -NoNewline -Encoding UTF8
+              return $true
+          }
+
+          function Set-FieldValue($path, $fieldName, $oldValueStr, $newValueStr) {
+              $rawContent = Get-Content $path -Raw
+              $pattern = '"' + [regex]::Escape($fieldName) + '"(\s*:\s*)"' + [regex]::Escape($oldValueStr) + '"'
+              if ($rawContent -notmatch $pattern) {
+                  throw "Could not find the exact '$fieldName' field ('$oldValueStr') to set in $path - refusing to guess and risk corrupting the file."
+              }
+              $newContent = $rawContent -replace $pattern, ('"' + $fieldName + '"$1"' + $newValueStr + '"')
+              Set-Content -Path $path -Value $newContent -NoNewline -Encoding UTF8
+          }
+
+          $changed = $false
+
+          $appJsonFiles = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
+              Where-Object { $_.FullName -notmatch '\\\.(altemplates|dependencies|alpackages)\\' }
+          foreach ($file in $appJsonFiles) {
+              if (Fix-BCMarker $file.FullName "version") { $changed = $true }
+          }
+
+          # The "main" app - same heuristic as AutoReleaseOnMerge's tag derivation - is the one
+          # repoVersion mirrors (test/BCPT apps can have their own independent version history).
+          $mainAppJsonFile = $appJsonFiles |
+              Where-Object { $_.FullName -notmatch '\.(Test|PerformanceTest)\\' } |
+              Select-Object -First 1
+          if ($mainAppJsonFile) {
+              $mainAppJson = Get-Content $mainAppJsonFile.FullName -Raw | ConvertFrom-Json
+              $mainVersion = [System.Version]$mainAppJson.version
+              $expectedRepoVersion = "$($mainVersion.Major).$($mainVersion.Minor).$($mainVersion.Build)"
+
+              $settingsFile = ".AL-Go/settings.json"
+              $currentRepoVersion = (Get-Content $settingsFile -Raw | ConvertFrom-Json).repoVersion
+              if ($currentRepoVersion -ne $expectedRepoVersion) {
+                  Write-Host "Syncing repoVersion to match $($mainAppJsonFile.FullName) : $currentRepoVersion -> $expectedRepoVersion"
+                  Set-FieldValue $settingsFile "repoVersion" $currentRepoVersion $expectedRepoVersion
+                  $changed = $true
+              }
+          }
+
+          if ($changed) {
+              # Always the default GITHUB_TOKEN, never the ghTokenWorkflow PAT - a push made
+              # with GITHUB_TOKEN never triggers "on: push" workflows (confirmed on this repo),
+              # so this correction commit stays invisible to CI/CD and everything downstream
+              # of it, regardless of what useGhTokenWorkflow was passed for the increment itself.
+              git config user.name "github-actions[bot]"
+              git config user.email "github-actions[bot]@users.noreply.github.com"
+              git add -A
+              git commit -m "Fix BC version marker after increment"
+              git push origin "HEAD:$($env:GITHUB_REF_NAME)"
+          } else {
+              Write-Host "Nothing to fix - BC version marker already correct everywhere."
+          }
+
       - name: Finalize the workflow
         if: always()
         uses: microsoft/AL-Go-Actions/WorkflowPostProcess@v9.2

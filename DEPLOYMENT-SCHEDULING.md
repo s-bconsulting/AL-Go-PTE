@@ -109,7 +109,7 @@ Au 14/09/2026, aucun des repos `ALGOPTESample`, `AL-Go-PTE` ni `AL-Go-AppSource`
   - `workflowType` : `"Release"` (déclenche `Create release`) ou `"ReleaseWithDeploy"` (déclenche `Create Release With Deploy`, voir section précédente).
   - `versionIncrement` : valeur passée à `IncrementVersionNumber` sur la branche de développement après la release (voir section suivante) — défaut `"+0.0.1"` si absent.
 - Déclenche le workflow choisi via `gh workflow run` (API GitHub), pas un appel direct — le run de ce workflow se termine tout de suite, le vrai workflow de release démarre comme un **run séparé** juste après dans l'onglet Actions.
-- Dérive le tag de release depuis `app.json`, **verbatim, les 4 segments tels quels** (ex. `10.4.3.280`) — pas de recomposition en 3 segments. Heuristique de recherche : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
+- Dérive le tag de release depuis `app.json`, en préservant les 4 segments — mais **pas au format brut `Major.Minor.Build.Revision`** (voir le point ⚠️ ci-dessous). Heuristique de recherche : premier `app.json` trouvé en excluant les dossiers ressemblant à des apps de test/performance (`.Test`, `.PerformanceTest`). **À ajuster si la structure du dépôt ne correspond pas à cette hypothèse** (ex. plusieurs vraies apps principales, convention de nommage différente).
 - Si un tag portant cette version existe déjà (le merge n'a pas fait bouger `app.json`), le workflow s'arrête sans rien faire plutôt que d'échouer sur un tag dupliqué.
 
 ### Convention de version chez SB Consulting
@@ -125,7 +125,9 @@ Contrairement à un simple compteur de build, chez SB Consulting chaque segment 
 
 Conséquence directe : `app.json.version` doit être bumpé **par la PR elle-même** (politique d'équipe) avant un merge qui doit déclencher une release — `AutoReleaseOnMerge` ne le fait jamais à la place de vous. C'est déjà la convention manuelle utilisée sur `SBLawyer-AL` (où `app.json` sur `main` correspond toujours exactement au tag de la dernière release) ; ce workflow ne fait que l'automatiser une fois la convention respectée en amont.
 
-**⚠️ Non vérifié en pratique** : le tag est transmis tel quel à l'API GitHub de création de release (`createRelease`, aucun parsing semver à cette étape), donc un tag à 4 segments devrait fonctionner sans souci — mais si `CreateReleaseNotes` (génération du changelog) compare des tags entre eux, un comportement avec des tags à 4 segments n'a pas encore été observé en conditions réelles. À surveiller au premier run.
+**⚠️ Confirmé en conditions réelles (16/09/2026) : un tag à 4 segments bruts (`Major.Minor.Build.Revision`, ex. `1.9.2.0`) casse `CreateReleaseNotes`** avec `'1.9.2.0' cannot be recognized as a semantic version string`. Cause, confirmée dans le code source de l'action Microsoft (`Github-Helper.psm1`, fonction `SemVerStrToSemVerObj`) : elle n'accepte que `Major.Minor.Patch`, éventuellement suivi de `-<segments additionnels séparés par '.'>` — un 4ᵉ segment numérique brut après un point la fait échouer (`if ($version.Revision -ne -1) { throw "not semver" }`).
+
+**Le tag est donc construit comme `Major.Minor.Build-Revision`** (ex. `1.9.2-0` au lieu de `1.9.2.0`) — un tiret avant le 4ᵉ segment au lieu d'un point. C'est du SemVer valide (le `-` introduit les "segments additionnels" que l'action sait lire et reconstruire à l'identique), et l'information du 4ᵉ segment n'est pas perdue, juste reponctuée.
 
 ### Incrément de version après la release — sur la branche de développement, jamais sur `main`
 
@@ -138,6 +140,14 @@ Le workflow bascule donc l'incrément de version sur la branche **source** de la
 - **Garde-fou** : si la branche de développement n'existe plus (cas exceptionnel — elle est censée être persistante, jamais supprimée après un merge), le workflow log un avertissement (`::warning::`) et n'essaie pas de déclencher `IncrementVersionNumber` sur une branche inexistante ; l'incrément est alors à faire manuellement.
 - L'incrément se fait en `directCommit: true` (commit direct sur la branche de développement, pas de PR à valider en plus) — à changer directement dans le workflow si vous préférez une PR ici aussi.
 - **`versioningStrategy: 3` est obligatoire** (ajouté dans `.AL-Go/settings.json`) — confirmé en lisant le code source de `microsoft/AL-Go-Actions/IncrementVersionNumber@v9.2` (`IncrementVersionNumber.ps1`) : l'incrément `+0.0.1` n'est autorisé que si `($settings.versioningStrategy -band 15) -eq 3`, sinon l'action échoue avec `"Incremental version number +0.0.1 is not allowed. Allowed incremental version numbers are: +1, +0.1"`. Sans ce réglage, ni cette fonctionnalité ni la suivante ne peuvent fonctionner avec le défaut `+0.0.1`.
+
+### 💡 Idée pour plus tard : déclarer le type d'incrément *avant* le merge, au lieu de bumper `OnPrem` manuellement
+
+**Constaté en conditions réelles (17/09/2026)** : `Auto Release On Merge` ne fait jamais qu'un miroir de `OnPrem` au moment du merge — `autoReleaseOnMerge.versionIncrement` (`+0.1` ou `+0.0.1`) ne s'applique **qu'après**, sur `OnPrem`, pour préparer le cycle suivant. Il ne détermine jamais la version **de la release en cours** : celle-ci est toujours exactement ce que contenait `app.json` sur `OnPrem` juste avant le merge — accumulé au fil des incréments `+0.0.1` continus d'`Auto Increment On CICD`.
+
+Aujourd'hui, si un merge "mérite" un vrai bump CU (beaucoup de changements), il faut le décider **soi-même, à la main, avant** d'ouvrir la PR (bumper `OnPrem` manuellement, ou dispatcher `IncrementVersionNumber.yaml --ref OnPrem` avec `+0.1`) — la release capturera alors cette valeur.
+
+Piste pour automatiser ce choix plus tard, si le besoin se confirme après un usage régulier : laisser déclarer "ce merge = bump CU" au moment de la PR (un label GitHub, ou une entrée dans le titre/corps de la PR), et faire en sorte qu'`Auto Release On Merge` applique ce bump à `OnPrem` **avant** de dériver le tag, plutôt que seulement après. Pas construit pour l'instant — à tester d'abord tel quel (bump manuel avant merge) et s'y habituer, avant d'ajouter cette couche.
 
 ## Workflow `Auto Increment On CICD` (ajouté le 15/09/2026, ✅ validé en conditions réelles sur ALGOPTESample le 15/09/2026 — les deux bugs ci-dessous ont été trouvés et corrigés grâce à ce test)
 
@@ -172,6 +182,84 @@ Ce workflow, à chaque incrément réussi, fait un commit direct (`directCommit:
 
 Le garde-fou applicatif (vérifier `github.event.workflow_run.head_commit.message` contre `"Incremented Version number by <valeur>"` / `"New Version number <valeur>"`, le texte exact produit par `IncrementVersionNumber.ps1` v9.2) reste en place en défense en profondeur — utile si vous passez un jour `useGhTokenWorkflow: true` (pour que le commit d'incrément soit lui-même validé par une CI/CD, ce qui utiliserait le PAT `GHTOKENWORKFLOW` et redéclencherait bien un run) — mais dans la configuration par défaut, il ne sera jamais sollicité.
 
+### ⚠️ Bug trouvé et corrigé (17/09/2026) : GitHub peut livrer le même événement plusieurs fois
+
+**Constaté en conditions réelles** : une seule vraie réussite de CI/CD sur `OnPrem` a déclenché ce workflow **3 fois**, environ 18 minutes plus tard (délai cohérent avec la latence de file d'attente du runner self-hosted), chacune dispatchant son propre `+0.0.1` — la version a donc avancé de 3 crans au lieu d'1 pour un seul événement réel. Confirmé en comparant les runs exacts (même `head_sha`, 3 déclenchements du workflow à quelques secondes d'écart, chacun réagissant à la même unique CI/CD).
+
+Aucun de nos garde-fous existants (boucle infinie, ni-configuré) n'était conçu pour ce cas : les 3 déclenchements portaient sur un commit "normal" (pas un commit d'incrément), donc le garde-fou anti-boucle ne s'applique pas ici — c'est un problème différent (livraison dupliquée d'un même événement), pas une boucle causée par notre propre commit.
+
+**Correctifs ajoutés** :
+- **`concurrency`** (fonctionnalité native GitHub Actions) au niveau du workflow, groupée par branche (`auto-increment-on-cicd-<branche>`) — sérialise les déclenchements simultanés/rapprochés au lieu de les laisser tourner en parallèle sans coordination.
+- **Garde-fou de commit dupliqué** : avant de dispatcher l'incrément, on vérifie que la branche est toujours exactement au commit qui a déclenché **ce** run (`github.event.workflow_run.head_sha`) — si elle a déjà bougé, un déclenchement précédent (dupliqué) s'en est déjà occupé, on s'arrête proprement.
+- **Attente de la fin du dispatch** avant que le job ne se termine — indispensable pour que la sérialisation par `concurrency` ait un effet réel : sans ça, un doublon mis en file d'attente vérifierait l'état de la branche **avant** que le premier ait fini de la modifier, et dispatcherait quand même son propre incrément en double.
+
+Même type de protection ajoutée par précaution sur `Auto Release On Merge` (`concurrency` par PR + commit de merge) — moins critique là-bas car son propre garde-fou "une release pour ce tag existe déjà" rattrape déjà une livraison dupliquée, mais évite de faire tourner deux attentes de CI/CD (jusqu'à 90 min chacune) en parallèle pour rien.
+
 ### ⚠️ Point de vigilance majeur
 
 Une fois `enabled: true` (sur `Auto Release On Merge` et/ou `Auto Increment On CICD`), des commits/releases/déploiements automatiques peuvent se produire sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
+
+## Réglage `versionBCPreserve` — encoder le marqueur BC dans le 3ᵉ segment (refonte du 16/09/2026)
+
+### Pourquoi le 4ᵉ segment a été abandonné pour porter le marqueur BC
+
+Première approche (essayée puis abandonnée) : préserver le marqueur BC sur le **4ᵉ segment** (`Revision`) à travers les incréments `IncrementVersionNumber`. Ça fonctionnait pour le fichier **committé dans git**, mais s'est révélé inutile en pratique : **le `.app` réellement compilé ne le conserve jamais**, quel que soit le réglage.
+
+Confirmé dans le code source de BcContainerHelper (`Run-AlPipeline.ps1`), exécuté juste avant la compilation, sur la copie de travail du runner (jamais sur le repo git) :
+```powershell
+if ($appBuild -eq -1) {
+    $version = [System.Version]::new($appJsonVersion.Major, $appJsonVersion.Minor, $appJsonVersion.Build, $appRevision)
+}
+```
+`$appRevision` est **toujours** calculé comme `runNumberOffset + GITHUB_RUN_NUMBER` (numéro de run GitHub), jamais dérivé de ce qui est committé — et il n'existe **aucun réglage** dans `settings.schema.json` pour désactiver cet écrasement. Par contre, ce même code montre que le **3ᵉ segment (`Build`)** est repris tel quel depuis `app.json` committé (`$appJsonVersion.Build`) quand `versioningStrategy` a ses 4 bits de poids faible à `3` (`appBuild -eq -1`) — **celui-là survit à la compilation**.
+
+### Le nouveau design : marqueur + compteur dans le 3ᵉ segment
+
+Le 3ᵉ segment encode maintenant `<marqueur BC 2 chiffres><compteur 3 chiffres>` — ex. `28001` = BC 28, build 1. Le 4ᵉ segment redevient simplement le numéro de build interne d'AL-Go, sans qu'on lutte contre lui.
+
+- Un incrément `+0.0.1` (utilisé par `Auto Increment On CICD`) fait déjà `Build = Build + 1` nativement dans AL-Go (`28001 → 28002`) — le préfixe survit **sans code custom**, tant qu'on ne dépasse pas 999 builds sous le même marqueur.
+- Un incrément `+0.1` (CU) ou `+1` (majeur), ou une valeur absolue, remet `Build` à `0` dans l'action Microsoft (`Set-VersionInSettingsFile`) — cassant le préfixe. C'est ce que corrige `versionBCPreserve`.
+- **Porter vers une nouvelle version BC** est un geste manuel : changer `versionBCMarker` dans `settings.json` — le compteur repart à zéro sous ce nouveau marqueur au prochain incrément.
+
+### Comment ça marche
+
+`.github/workflows/IncrementVersionNumber.yaml` (fichier de ce repo, pas une action externe fermée) a une étape `Fix BC version marker` après l'étape standard `Increment Version Number`, active uniquement si `versionBCPreserve: true` **et** `versionBCMarker` renseigné dans `.AL-Go/settings.json`. Contrairement à l'ancienne version (capturer avant / restaurer après), celle-ci est **sans état** : elle vérifie juste, après coup, si le préfixe du 3ᵉ segment correspond à `versionBCMarker` et le corrige si besoin — peu importe quel type d'incrément (`+1`, `+0.1`, `+0.0.1`, absolu) a causé l'écart. Elle corrige à la fois `repoVersion` (dans `settings.json`) et le `version` de **tous** les `app.json` du repo (principal, test, BCPT), puisque les deux doivent rester cohérents (voir section suivante).
+
+Remplacement ciblé du seul champ concerné dans le texte brut du fichier (regex sur `"<champ>"(\s*:\s*)"<ancienne valeur>"`) — jamais un `ConvertTo-Json` sur l'objet entier, qui réindenterait tout le fichier (bug rencontré et corrigé sur l'ancienne version de ce mécanisme).
+
+### Pourquoi ça ne déclenche pas les automatisations deux fois
+
+Le commit correctif utilise **toujours** le `GITHUB_TOKEN` par défaut du job (jamais le PAT `GHTOKENWORKFLOW`), quel que soit le réglage `useGhTokenWorkflow` passé pour l'incrément lui-même. Comme confirmé plus haut, un push fait avec `GITHUB_TOKEN` ne déclenche jamais de workflow `on: push` — donc ni la CI/CD, ni `Auto Increment On CICD` ne se redéclenchent à cause de ce commit, exactement comme le premier commit de l'action Microsoft.
+
+### `repoVersion` aligné sur `app.json` — synchronisé nous-mêmes, pas via le bit 16
+
+Exigence : `repoVersion` doit porter le même nom/tag que la version de l'app (sauf en multi-projets, où chaque projet a son propre `settings.json`).
+
+**Première tentative abandonnée** : le bit `16` de `versioningStrategy` (`useRepoVersion`), documenté dans `Set-VersionInAppManifests` :
+```powershell
+$useRepoVersion = (($projectSettings.versioningStrategy -band 16) -eq 16)
+if ($useRepoVersion) {
+    $newValue = $projectSettings.repoVersion
+}
+```
+devrait forcer chaque `app.json` à prendre la valeur de `repoVersion` à chaque incrément. **Testé en conditions réelles (16/09/2026) : ça ne se comporte pas comme documenté.** Après qu'un edit manuel d'`app.json` (hors du workflow d'incrément) a cassé l'alignement initial, l'incrément automatique suivant n'a **pas** resynchronisé `app.json` sur `repoVersion` — chaque fichier a continué d'avancer indépendamment depuis sa propre valeur, l'écart se creusant à chaque `+0.1`/`+0.0.1`. Repro confirmée en comparant les diffs exacts des commits AL-Go successifs. Cause exacte non identifiée (résolution des settings par projet ?) — pas assez fiable pour en dépendre.
+
+**Solution retenue : on fait la synchronisation nous-mêmes**, dans notre propre étape `Fix BC version marker`, plutôt que de compter sur ce bit. Après avoir corrigé le marqueur BC de chaque `app.json`, l'étape relit la version de l'**app principale** (même heuristique que la dérivation du tag dans `Auto Release On Merge` : premier `app.json` hors dossiers `.Test`/`.PerformanceTest`) et force `repoVersion` à valoir exactement son `Major.Minor.Build` — à chaque run, que le marqueur ait eu besoin d'être corrigé ou non. `app.json` reste l'unique source de vérité ; `repoVersion` le suit systématiquement.
+
+`versioningStrategy` reste donc à **`3` seul** (pas `19`) — le bit 16 n'est plus utilisé du tout.
+
+`repoVersion` reste à **3 segments** (`Major.Minor.Build`, sans 4ᵉ) — le 4ᵉ segment ne porte de toute façon aucune information puisqu'il est toujours écrasé à la compilation.
+
+### Réglages
+
+```json
+"versioningStrategy": 3,
+"versionBCPreserve": true,
+"versionBCMarker": 28
+```
+
+- `versionBCPreserve` : `false` par défaut (absent = désactivé) — rien de custom ne s'exécute, comportement 100% standard AL-Go (y compris la synchro `repoVersion`, qui fait partie du même mécanisme).
+- `versionBCMarker` : `0` ou absent désactive aussi la correction (traité comme "pas de marqueur à appliquer"), même si `versionBCPreserve` est à `true`.
+- **Volontairement indépendant de la valeur exacte de `versioningStrategy`** — coupler notre logique à un nombre précis aurait été fragile si Microsoft change un jour le sens de ce réglage.
+
+**⚠️ Non testé en conditions réelles au moment de l'écriture** (refonte du 16/09/2026, v2 — abandon du bit 16 au profit d'une synchro maison) — à valider au prochain incrément réel.
