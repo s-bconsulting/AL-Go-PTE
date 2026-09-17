@@ -141,6 +141,14 @@ Le workflow bascule donc l'incrément de version sur la branche **source** de la
 - L'incrément se fait en `directCommit: true` (commit direct sur la branche de développement, pas de PR à valider en plus) — à changer directement dans le workflow si vous préférez une PR ici aussi.
 - **`versioningStrategy: 3` est obligatoire** (ajouté dans `.AL-Go/settings.json`) — confirmé en lisant le code source de `microsoft/AL-Go-Actions/IncrementVersionNumber@v9.2` (`IncrementVersionNumber.ps1`) : l'incrément `+0.0.1` n'est autorisé que si `($settings.versioningStrategy -band 15) -eq 3`, sinon l'action échoue avec `"Incremental version number +0.0.1 is not allowed. Allowed incremental version numbers are: +1, +0.1"`. Sans ce réglage, ni cette fonctionnalité ni la suivante ne peuvent fonctionner avec le défaut `+0.0.1`.
 
+### 💡 Idée pour plus tard : déclarer le type d'incrément *avant* le merge, au lieu de bumper `OnPrem` manuellement
+
+**Constaté en conditions réelles (17/09/2026)** : `Auto Release On Merge` ne fait jamais qu'un miroir de `OnPrem` au moment du merge — `autoReleaseOnMerge.versionIncrement` (`+0.1` ou `+0.0.1`) ne s'applique **qu'après**, sur `OnPrem`, pour préparer le cycle suivant. Il ne détermine jamais la version **de la release en cours** : celle-ci est toujours exactement ce que contenait `app.json` sur `OnPrem` juste avant le merge — accumulé au fil des incréments `+0.0.1` continus d'`Auto Increment On CICD`.
+
+Aujourd'hui, si un merge "mérite" un vrai bump CU (beaucoup de changements), il faut le décider **soi-même, à la main, avant** d'ouvrir la PR (bumper `OnPrem` manuellement, ou dispatcher `IncrementVersionNumber.yaml --ref OnPrem` avec `+0.1`) — la release capturera alors cette valeur.
+
+Piste pour automatiser ce choix plus tard, si le besoin se confirme après un usage régulier : laisser déclarer "ce merge = bump CU" au moment de la PR (un label GitHub, ou une entrée dans le titre/corps de la PR), et faire en sorte qu'`Auto Release On Merge` applique ce bump à `OnPrem` **avant** de dériver le tag, plutôt que seulement après. Pas construit pour l'instant — à tester d'abord tel quel (bump manuel avant merge) et s'y habituer, avant d'ajouter cette couche.
+
 ## Workflow `Auto Increment On CICD` (ajouté le 15/09/2026, ✅ validé en conditions réelles sur ALGOPTESample le 15/09/2026 — les deux bugs ci-dessous ont été trouvés et corrigés grâce à ce test)
 
 `.github/workflows/AutoIncrementOnCICD.yaml` — fait avancer automatiquement `app.json` sur la branche de développement à **chaque** réussite de CI/CD, indépendamment de toute release. Complète `Auto Release On Merge` (qui ne bump la branche de dev qu'une seule fois, juste après une release) par un incrément continu au fil du développement.
