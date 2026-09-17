@@ -15,6 +15,15 @@ on:
   pull_request:
     types: [ closed ]
 
+# A duplicate delivery of the same PR-closed event would still be caught correctly by the
+# existing "does a release for this tag already exist" guard further down (the second one just
+# skips) - but without this, both would independently run the full 90-minute CI/CD-wait poll in
+# parallel first, wasting a runner slot for nothing. Confirmed elsewhere (AutoIncrementOnCICD.yaml,
+# 16/09/2026) that GitHub can redeliver the same event multiple times, so this is cheap insurance.
+concurrency:
+  group: auto-release-on-merge-${{ github.event.pull_request.number }}-${{ github.event.pull_request.merge_commit_sha }}
+  cancel-in-progress: false
+
 permissions:
   # actions: write is required by "gh workflow run" (creating a workflow_dispatch event) -
   # confirmed via a real 403 "Resource not accessible by integration" on AutoIncrementOnCICD.yaml

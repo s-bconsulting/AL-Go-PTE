@@ -174,6 +174,19 @@ Ce workflow, à chaque incrément réussi, fait un commit direct (`directCommit:
 
 Le garde-fou applicatif (vérifier `github.event.workflow_run.head_commit.message` contre `"Incremented Version number by <valeur>"` / `"New Version number <valeur>"`, le texte exact produit par `IncrementVersionNumber.ps1` v9.2) reste en place en défense en profondeur — utile si vous passez un jour `useGhTokenWorkflow: true` (pour que le commit d'incrément soit lui-même validé par une CI/CD, ce qui utiliserait le PAT `GHTOKENWORKFLOW` et redéclencherait bien un run) — mais dans la configuration par défaut, il ne sera jamais sollicité.
 
+### ⚠️ Bug trouvé et corrigé (17/09/2026) : GitHub peut livrer le même événement plusieurs fois
+
+**Constaté en conditions réelles** : une seule vraie réussite de CI/CD sur `OnPrem` a déclenché ce workflow **3 fois**, environ 18 minutes plus tard (délai cohérent avec la latence de file d'attente du runner self-hosted), chacune dispatchant son propre `+0.0.1` — la version a donc avancé de 3 crans au lieu d'1 pour un seul événement réel. Confirmé en comparant les runs exacts (même `head_sha`, 3 déclenchements du workflow à quelques secondes d'écart, chacun réagissant à la même unique CI/CD).
+
+Aucun de nos garde-fous existants (boucle infinie, ni-configuré) n'était conçu pour ce cas : les 3 déclenchements portaient sur un commit "normal" (pas un commit d'incrément), donc le garde-fou anti-boucle ne s'applique pas ici — c'est un problème différent (livraison dupliquée d'un même événement), pas une boucle causée par notre propre commit.
+
+**Correctifs ajoutés** :
+- **`concurrency`** (fonctionnalité native GitHub Actions) au niveau du workflow, groupée par branche (`auto-increment-on-cicd-<branche>`) — sérialise les déclenchements simultanés/rapprochés au lieu de les laisser tourner en parallèle sans coordination.
+- **Garde-fou de commit dupliqué** : avant de dispatcher l'incrément, on vérifie que la branche est toujours exactement au commit qui a déclenché **ce** run (`github.event.workflow_run.head_sha`) — si elle a déjà bougé, un déclenchement précédent (dupliqué) s'en est déjà occupé, on s'arrête proprement.
+- **Attente de la fin du dispatch** avant que le job ne se termine — indispensable pour que la sérialisation par `concurrency` ait un effet réel : sans ça, un doublon mis en file d'attente vérifierait l'état de la branche **avant** que le premier ait fini de la modifier, et dispatcherait quand même son propre incrément en double.
+
+Même type de protection ajoutée par précaution sur `Auto Release On Merge` (`concurrency` par PR + commit de merge) — moins critique là-bas car son propre garde-fou "une release pour ce tag existe déjà" rattrape déjà une livraison dupliquée, mais évite de faire tourner deux attentes de CI/CD (jusqu'à 90 min chacune) en parallèle pour rien.
+
 ### ⚠️ Point de vigilance majeur
 
 Une fois `enabled: true` (sur `Auto Release On Merge` et/ou `Auto Increment On CICD`), des commits/releases/déploiements automatiques peuvent se produire sans validation humaine supplémentaire — plus radical que tout ce qu'on a construit jusqu'ici. À activer uniquement en connaissance de cause, et à tester d'abord sur un dépôt/branche non-critique avant un usage réel.
