@@ -9,7 +9,7 @@ on:
       - '!.github/workflows/CICD.yaml'
     # 'OnPrem' added so CI/CD actually runs on the persistent development branch - required for
     # AutoIncrementOnCICD.yaml (workflow_run on this workflow's completion) to ever fire there.
-    # Adjust if your dev branch has a different name - see DEPLOYMENT-SCHEDULING.md.
+    # Adjust if your dev branch has a different name - see docs/DEPLOYMENT-SCHEDULING.md.
     branches: [ 'main', 'release/*', 'feature/*', 'OnPrem' ]
 
 defaults:

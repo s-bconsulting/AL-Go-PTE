@@ -3,14 +3,14 @@ name: ' Auto Release On Merge'
 # Reacts to every merged PR, on every branch (GitHub requires this trigger filter to be static
 # YAML - it can't read settings.json before the job starts). The enabled/branch check happens
 # inside the job itself, driven by the "autoReleaseOnMerge" setting - see
-# DEPLOYMENT-SCHEDULING.md for details and known limitations.
+# docs/DEPLOYMENT-SCHEDULING.md for details and known limitations.
 #
 # Deliberately scoped to real PR merges only (not "any CI/CD success" - that would also fire on
 # CI/CD's own scheduled/nightly runs and manual dispatches, with no merge involved at all). To
 # still guarantee the release is only created from a validated commit, the job waits for the
 # CI/CD run on the exact merge commit to complete successfully before triggering the release,
 # instead of firing immediately and racing the asynchronous CI/CD run that starts right after
-# the merge - see DEPLOYMENT-SCHEDULING.md for the incident this avoids.
+# the merge - see docs/DEPLOYMENT-SCHEDULING.md for the incident this avoids.
 on:
   pull_request:
     types: [ closed ]
@@ -114,7 +114,7 @@ jobs:
           # segments - do NOT collapse it to a 3-segment "Major.Minor.0" shape. Unlike a generic
           # build/revision counter, every segment here can carry real meaning (e.g. a product
           # major/CU/fix scheme plus a manually-set BC-compatibility marker) - rewriting the
-          # version would silently discard that. See DEPLOYMENT-SCHEDULING.md.
+          # version would silently discard that. See docs/DEPLOYMENT-SCHEDULING.md.
           # Heuristic: first app.json found, excluding folders that look like test/performance apps.
           # If your repo layout doesn't match this assumption, adjust this section.
           $appJsonFile = Get-ChildItem -Path . -Recurse -Filter "app.json" -File |
@@ -172,7 +172,7 @@ jobs:
           # must never be bumped here. Instead, bump the version on the branch this PR came FROM
           # (the persistent development branch, e.g. "develop"), so ongoing work already targets
           # the next version. Controlled by autoReleaseOnMerge.versionIncrement, defaulting to
-          # "+0.0.1" (advances the build/fix segment only) if not set. See DEPLOYMENT-SCHEDULING.md.
+          # "+0.0.1" (advances the build/fix segment only) if not set. See docs/DEPLOYMENT-SCHEDULING.md.
           $versionIncrement = if ($auto.versionIncrement) { $auto.versionIncrement } else { '+0.0.1' }
 
           gh api "repos/$($env:Repository)/branches/$($env:HeadRef)" 1>$null 2>$null

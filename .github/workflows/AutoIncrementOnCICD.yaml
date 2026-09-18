@@ -2,7 +2,7 @@ name: ' Auto Increment On CICD'
 
 # Reacts to CI/CD succeeding, to keep the development branch's version moving forward
 # automatically as work lands on it - independent of AutoReleaseOnMerge.yaml, which only bumps
-# the dev branch once, right after a release is cut from main. See DEPLOYMENT-SCHEDULING.md.
+# the dev branch once, right after a release is cut from main. See docs/DEPLOYMENT-SCHEDULING.md.
 #
 # Deliberately NOT scoped by a static "on: push: branches:" filter here - CI/CD itself already
 # does that scoping (CICD.yaml's own branches list), and this workflow only needs to react to
