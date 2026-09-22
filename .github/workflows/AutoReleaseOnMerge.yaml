@@ -32,9 +32,34 @@ permissions:
   contents: read
 
 jobs:
-  CheckAndTriggerRelease:
+  # A separate, cheap job just to read the githubRunner setting before the real job starts -
+  # job-level "runs-on" can't depend on a step's own output within the same job, so the real
+  # work below needs this split to run on a self-hosted runner when configured (same pattern
+  # AL-Go's own CICD.yaml uses for its Build job). Without this, the whole polling wait below
+  # (up to 90 minutes) would always run on windows-latest and be fully billable, even on repos
+  # where the actual compile work is already free on a self-hosted runner - confirmed as a real
+  # cost driver on ALGOPTESample (17 min average, 10 runs, ~172 billable minutes) before this fix.
+  Initialization:
     if: github.event.pull_request.merged == true
     runs-on: windows-latest
+    outputs:
+      githubRunner: ${{ steps.ReadSettings.outputs.GitHubRunnerJson }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.merge_commit_sha }}
+
+      - name: Read settings
+        id: ReadSettings
+        uses: microsoft/AL-Go-Actions/ReadSettings@v9.2
+        with:
+          shell: powershell
+
+  CheckAndTriggerRelease:
+    needs: [ Initialization ]
+    if: github.event.pull_request.merged == true
+    runs-on: ${{ fromJson(needs.Initialization.outputs.githubRunner) }}
     defaults:
       run:
         shell: powershell
