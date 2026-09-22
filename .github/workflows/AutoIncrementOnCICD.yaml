@@ -30,9 +30,33 @@ permissions:
   contents: read
 
 jobs:
-  CheckAndTriggerIncrement:
+  # A separate, cheap job just to read the githubRunner setting before the real job starts -
+  # job-level "runs-on" can't depend on a step's own output within the same job, so the real
+  # work below needs this split to run on a self-hosted runner when configured (same pattern
+  # AL-Go's own CICD.yaml uses for its Build job). Without this, the whole dispatch-and-wait
+  # below would always run on windows-latest and be fully billable, even on repos where the
+  # actual compile work is already free on a self-hosted runner.
+  Initialization:
     if: github.event.workflow_run.conclusion == 'success'
     runs-on: windows-latest
+    outputs:
+      githubRunner: ${{ steps.ReadSettings.outputs.GitHubRunnerJson }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - name: Read settings
+        id: ReadSettings
+        uses: microsoft/AL-Go-Actions/ReadSettings@v9.2
+        with:
+          shell: powershell
+
+  CheckAndTriggerIncrement:
+    needs: [ Initialization ]
+    if: github.event.workflow_run.conclusion == 'success'
+    runs-on: ${{ fromJson(needs.Initialization.outputs.githubRunner) }}
     defaults:
       run:
         shell: powershell
