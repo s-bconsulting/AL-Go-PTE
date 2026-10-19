@@ -5,6 +5,17 @@ All notable changes to the `bc-xlf-translator` skill will be documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-10-19 - @SBAurelien
+
+### Added
+
+- `versions` subcommand and step 0: the most recent installed copy of the skill (repo, personal or organisation) is the one followed
+- Standard glossary `glossary.std.<lang>.md` generated from the translation files of the `.alpackages` dependencies (Base Application, other Microsoft apps, other publishers), with the source versions in its header
+- `std-status` (checked at every run, regenerated when missing or on a new major version), `std-build`, `std-lookup` and `std-conflicts` subcommands; the dependencies' xlf files are read in memory from the `.app` packages, nothing is extracted to disk
+- Conflicts between the standard and the business vocabulary are asked to the user, the business wording being recommended; accepted gaps are kept in the "Écarts avec le standard" section of the extension glossary
+- Every target language found in `Translations` is processed, each with its own glossaries
+- Three-letter Windows language codes recognised in AL comments for the other languages (`DEU=`, `NLB=`…)
+
 ## [1.2.0] - 2026-09-30 - @SBAurelien
 
 ### Added
