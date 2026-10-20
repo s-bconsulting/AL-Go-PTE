@@ -2,6 +2,14 @@
 """Translate Business Central XLIFF files from Developer comments.
 
 Subcommands:
+  versions       List the copies of this skill (repo, personal, organisation) with
+                 their CHANGELOG version and tell which one is the most recent.
+  std-status     Compare the standard glossary (glossary.std.<lang>.md) with the
+                 translation files of the dependencies found in .alpackages.
+  std-build      Read those translation files and (re)write the standard glossary.
+  std-lookup     Search the dependencies' translation files for a term.
+  std-conflicts  List the terms whose translation in the extension glossary differs
+                 from the standard glossary.
   extract  List pending trans-units (state not translated/final/signed-off or empty
            target). Splits them into units whose translation comes from the AL
            Comment (Developer note) and units that need a suggested translation.
@@ -15,11 +23,15 @@ order, encoding and line endings are preserved byte for byte outside the
 touched <target> elements.
 """
 import argparse
+import datetime
 import html
+import io
 import json
 import re
 import sys
+import zipfile
 from pathlib import Path
+from urllib.parse import unquote
 
 DONE_STATES = {"translated", "final", "signed-off"}
 UNIT_RE = re.compile(r"<trans-unit\b[^>]*>.*?</trans-unit>", re.DOTALL)
@@ -30,12 +42,23 @@ STATE_RE = re.compile(r'\bstate="([^"]*)"')
 DEV_NOTE_RE = re.compile(r'<note from="Developer"[^>]*?(?:/>|>(.*?)</note>)', re.DOTALL)
 GEN_NOTE_RE = re.compile(r'<note from="Xliff Generator"[^>]*?(?:/>|>(.*?)</note>)', re.DOTALL)
 PLACEHOLDER_RE = re.compile(r"%\d+|#\d+#+")
+CAPTION_ID = "Property 2879900210"
+SKILL_NAME = "bc-xlf-translator"
+VERSION_RE = re.compile(r"^## \[(\d+)\.(\d+)\.(\d+)\]", re.MULTILINE)
+SOURCES_RE = re.compile(r"<!-- bc-xlf-translator:std-sources\s*(.*?)-->", re.DOTALL)
+# Three-letter Windows language codes used in older AL comments (FRA=...).
+LANG_CODES = {
+    "fr-fr": "FRA", "fr-be": "FRB", "fr-ch": "FRS", "fr-ca": "FRC",
+    "de-de": "DEU", "de-at": "DEA", "de-ch": "DES", "nl-nl": "NLD", "nl-be": "NLB",
+    "en-gb": "ENG", "es-es": "ESP", "it-it": "ITA", "pt-pt": "PTG", "da-dk": "DAN",
+    "sv-se": "SVE", "nb-no": "NOR", "fi-fi": "FIN", "cs-cz": "CSY", "pl-pl": "PLK",
+}
 
 
 def lang_aliases(lang):
     aliases = {lang}
-    if lang.lower() == "fr-fr":
-        aliases.add("FRA")
+    if lang.lower() in LANG_CODES:
+        aliases.add(LANG_CODES[lang.lower()])
     return aliases
 
 
@@ -184,6 +207,293 @@ def cmd_terms(args):
         sys.stdout.buffer.write(f"{sum(targets.values())}\t{source}\t{variants}\n".encode("utf-8"))
 
 
+# --- Skill copies -----------------------------------------------------------
+
+def skill_version(folder):
+    log = Path(folder) / "CHANGELOG.md"
+    if not log.is_file():
+        return None
+    m = VERSION_RE.search(log.read_text(encoding="utf-8"))
+    return tuple(int(x) for x in m.groups()) if m else None
+
+
+def cmd_versions(args):
+    """List the copies of the skill and point to the most recent one."""
+    skills = Path.home() / ".claude" / "skills"
+    found = []
+    start = Path(args.repo).resolve()
+    for folder in [start, *start.parents]:
+        copy = folder / ".claude" / "skills" / SKILL_NAME
+        if copy.is_dir():
+            found.append(("repo", copy))
+    found.append(("personal", skills / SKILL_NAME))
+    found += [("organisation", c) for c in sorted((skills / "synced").glob(f"*/{SKILL_NAME}"))]
+    running = Path(__file__).resolve().parent.parent
+    found.append(("running", running))
+    copies, seen = [], set()
+    for kind, path in found:
+        path = path.resolve()
+        if not path.is_dir() or path in seen:
+            continue
+        seen.add(path)
+        if path == (skills / SKILL_NAME).resolve():
+            kind = "personal"
+        copies.append((kind, skill_version(path) or (0, 0, 0), path))
+    newest = max(copies, key=lambda c: c[1])
+    running_version = skill_version(running) or (0, 0, 0)
+    for kind, version, path in copies:
+        flags = (" [running]" if path == running else "") + (" [newest]" if version == newest[1] else "")
+        print(f"{kind}\t{'.'.join(map(str, version))}\t{path}{flags}")
+    if newest[1] > running_version:
+        print(f"NEWER COPY: {newest[0]} {'.'.join(map(str, newest[1]))} at {newest[2]} "
+              f"(running {'.'.join(map(str, running_version))}). Use that copy.")
+    else:
+        print("running copy is the most recent")
+
+
+# --- Dependencies (.alpackages) ---------------------------------------------
+
+def vtuple(version):
+    return tuple(int(x) for x in re.findall(r"\d+", version or "0"))
+
+
+def open_app(path):
+    """Open the zip held in a .app package (NAVX header followed by a zip)."""
+    data = Path(path).read_bytes()
+    start = data.find(b"PK\x03\x04")
+    if start < 0:
+        return None
+    try:
+        return zipfile.ZipFile(io.BytesIO(data[start:]))
+    except zipfile.BadZipFile:
+        return None
+
+
+def app_info(zf):
+    manifest = zf.read("NavxManifest.xml").decode("utf-8-sig", "replace")
+    tag = re.search(r"<App\b[^>]*>", manifest).group(0)
+    attrs = {k: html.unescape(v) for k, v in re.findall(r'(\w+)="([^"]*)"', tag)}
+    return attrs.get("Publisher", ""), attrs.get("Name", ""), attrs.get("Version", "")
+
+
+def own_app_name(xlf_dir):
+    for folder in (xlf_dir.parent, xlf_dir):
+        app_json = folder / "app.json"
+        if app_json.is_file():
+            return json.loads(app_json.read_text(encoding="utf-8-sig")).get("name")
+    return None
+
+
+def find_alpackages(xlf_dir, explicit):
+    if explicit:
+        return Path(explicit)
+    for folder in [xlf_dir, *xlf_dir.parents]:
+        if (folder / ".alpackages").is_dir():
+            return folder / ".alpackages"
+    sys.exit(f"no .alpackages folder found above {xlf_dir}; pass --alpackages")
+
+
+def dependency_xlfs(alpackages, lang, own_name):
+    """Most recent package of each app holding a <lang> translation file."""
+    best = {}
+    for package in sorted(alpackages.glob("*.app")):
+        zf = open_app(package)
+        if zf is None:
+            continue
+        try:
+            publisher, name, version = app_info(zf)
+        except (KeyError, AttributeError):
+            continue
+        if name == own_name:
+            continue
+        entry = next((n for n in zf.namelist()
+                      if unquote(n).lower().endswith(f".{lang.lower()}.xlf")), None)
+        if entry is None:
+            continue
+        key = (publisher, name)
+        if key not in best or vtuple(version) > vtuple(best[key]["version"]):
+            best[key] = {"publisher": publisher, "name": name, "version": version,
+                         "package": package, "entry": entry}
+    return sorted(best.values(),
+                  key=lambda a: (a["publisher"] != "Microsoft", a["name"] != "Base Application", a["name"]))
+
+
+def std_glossary_path(xlf_dir, lang):
+    return xlf_dir / f"glossary.std.{lang}.md"
+
+
+def std_sources(path):
+    """Apps and versions recorded in the header of the standard glossary."""
+    if not path.is_file():
+        return None
+    m = SOURCES_RE.search(path.read_text(encoding="utf-8"))
+    sources = {}
+    for line in (m.group(1).splitlines() if m else []):
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) == 3:
+            sources[(parts[0], parts[1])] = parts[2]
+    return sources
+
+
+def read_dependency_xlf(app):
+    """Translation file of a dependency, read in memory (nothing written to disk)."""
+    return open_app(app["package"]).read(app["entry"]).decode("utf-8-sig")
+
+
+def cmd_std_status(args):
+    xlf_dir = Path(args.dir).resolve()
+    glossary = std_glossary_path(xlf_dir, args.lang)
+    sources = std_sources(glossary)
+    apps = dependency_xlfs(find_alpackages(xlf_dir, args.alpackages), args.lang, own_app_name(xlf_dir))
+    print(f"standard glossary: {glossary} ({'absent' if sources is None else 'present'})")
+    needed = sources is None
+    for app in apps:
+        recorded = (sources or {}).get((app["publisher"], app["name"]))
+        if recorded is None:
+            status, needed = "missing", True
+        elif vtuple(app["version"])[:1] > vtuple(recorded)[:1]:
+            status, needed = "new-major", True
+        elif vtuple(app["version"])[:1] < vtuple(recorded)[:1]:
+            status = "older-major (kept)"
+        else:
+            status = "ok"
+        line = (f"{app['publisher']} | {app['name']} | glossary {recorded or '-'} | "
+                f"package {app['version']} | {status}\n")
+        sys.stdout.buffer.write(line.encode("utf-8"))
+    for publisher, name in sorted(set(sources or {}) - {(a["publisher"], a["name"]) for a in apps}):
+        print(f"{publisher} | {name} | glossary {sources[(publisher, name)]} | not in .alpackages (kept)")
+    print(f"update needed: {'yes' if needed else 'no'}")
+
+
+def caption_terms(text, max_words):
+    counts = {}
+    for m in UNIT_RE.finditer(text):
+        block = m.group(0)
+        if CAPTION_ID + '"' not in block.split(">", 1)[0]:
+            continue
+        u = parse_unit(block)
+        if (u["state"] in DONE_STATES or u["state"] is None) and u["target"].strip() \
+                and len(u["source"].split()) <= max_words:
+            counts.setdefault(u["source"], {}).setdefault(u["target"], 0)
+            counts[u["source"]][u["target"]] += 1
+    return sorted(counts.items(), key=lambda kv: (-sum(kv[1].values()), kv[0]))
+
+
+def md_cell(value):
+    return value.replace("|", "\\|").replace("\r", " ").replace("\n", " ")
+
+
+def cmd_std_build(args):
+    xlf_dir = Path(args.dir).resolve()
+    apps = dependency_xlfs(find_alpackages(xlf_dir, args.alpackages), args.lang, own_app_name(xlf_dir))
+    if not apps:
+        sys.exit(f"no {args.lang} translation file found in the dependencies")
+    sections, summary = [], []
+    for app in apps:
+        limit = args.limit_base if app["name"] == "Base Application" else args.limit
+        rows = caption_terms(read_dependency_xlf(app), args.max_words)[:limit]
+        summary.append((app, len(rows)))
+        lines = [f"## {app['name']} ({app['publisher']} {app['version']})", "",
+                 "| Anglais | Traduction | Occurrences | Variantes |", "|---|---|---|---|"]
+        for source, targets in rows:
+            ranked = sorted(targets.items(), key=lambda kv: -kv[1])
+            variants = ", ".join(f"{t} ({n})" for t, n in ranked[1:4])
+            lines.append(f"| {md_cell(source)} | {md_cell(ranked[0][0])} | "
+                         f"{sum(targets.values())} | {md_cell(variants)} |")
+        sections.append("\n".join(lines))
+        line = f"{app['publisher']} | {app['name']} | {app['version']} | {len(rows)} terms\n"
+        sys.stdout.buffer.write(line.encode("utf-8"))
+    header = [
+        f"# Glossaire standard Business Central (en-US → {args.lang})", "",
+        "Fichier généré par la compétence `bc-xlf-translator` (commande `std-build`) à partir",
+        "des fichiers de traduction des dépendances présentes dans `.alpackages`. Ne pas le",
+        "modifier à la main : il est réécrit à chaque nouvelle version majeure d'une dépendance.",
+        f"Les choix propres à l'extension vont dans `glossary.{args.lang}.md`, qui prime sur ce fichier.",
+        "", f"Généré le {datetime.date.today().isoformat()}.", "",
+        "<!-- bc-xlf-translator:std-sources",
+        *[f"{a['publisher']} | {a['name']} | {a['version']}" for a, _ in summary],
+        "-->", "",
+        "| Application | Éditeur | Version | Termes |", "|---|---|---|---|",
+        *[f"| {a['name']} | {a['publisher']} | {a['version']} | {n} |" for a, n in summary],
+    ]
+    out = std_glossary_path(xlf_dir, args.lang)
+    out.write_text("\n".join(header) + "\n\n" + "\n\n".join(sections) + "\n", encoding="utf-8")
+    sys.stdout.buffer.write(f"written: {out}\n".encode("utf-8"))
+
+
+def cmd_std_lookup(args):
+    xlf_dir = Path(args.dir).resolve()
+    apps = dependency_xlfs(find_alpackages(xlf_dir, args.alpackages), args.lang, own_app_name(xlf_dir))
+    if args.app:
+        apps = [a for a in apps if a["name"].lower() == args.app.lower()]
+    term, hits = args.term.lower(), 0
+    for app in apps:
+        for m in UNIT_RE.finditer(read_dependency_xlf(app)):
+            u = parse_unit(m.group(0))
+            if u["target"] and term in u["source"].lower():
+                sys.stdout.buffer.write(f"[{app['name']}] {u['source']}  =>  {u['target']}\n".encode("utf-8"))
+                hits += 1
+                if hits >= args.limit:
+                    print(f"{hits} hit(s)", file=sys.stderr)
+                    return
+    print(f"{hits} hit(s)", file=sys.stderr)
+
+
+def norm(value):
+    value = value.replace("\u2019", "'").replace("`", "").strip().rstrip(".")
+    return re.sub(r"\s+", " ", value).lower()
+
+
+def md_tables(path):
+    """Yield (section title, cells) for each data row of the markdown tables."""
+    section, in_table = "", False
+    for line in path.read_text(encoding="utf-8").splitlines():
+        stripped = line.strip()
+        if stripped.startswith("## "):
+            section = stripped[3:].strip()
+        if not stripped.startswith("|"):
+            in_table = False
+            continue
+        if not in_table:
+            in_table = True  # header row
+            continue
+        if re.fullmatch(r"\|[\s:|-]+\|?", stripped):
+            continue  # separator row
+        yield section, [c.strip().replace("\\|", "|") for c in re.split(r"(?<!\\)\|", stripped)[1:-1]]
+
+
+def cmd_std_conflicts(args):
+    glossary, std = Path(args.glossary), Path(args.std)
+    standard = {}
+    for section, cells in md_tables(std):
+        if len(cells) >= 2 and "(" in section:
+            standard.setdefault(norm(cells[0]), (cells[1], section.split(" (")[0],
+                                                 cells[3] if len(cells) > 3 else ""))
+    accepted, business = {}, []
+    for section, cells in md_tables(glossary):
+        if len(cells) < 2:
+            continue
+        title = section.lower()
+        if title.startswith("écarts"):
+            accepted[norm(cells[0])] = norm(cells[1])
+        elif not title.startswith(("règles", "décisions", "à arbitrer")):
+            business.append((cells[0], cells[1]))
+    rows = []
+    for english, chosen in business:
+        hit = standard.get(norm(english))
+        if not hit or norm(chosen) == norm(hit[0]):
+            continue
+        if accepted.get(norm(english)) == norm(hit[0]):
+            continue  # gap already validated against this standard wording
+        rows.append((english, chosen, f"{hit[0]} ({hit[1]})", hit[2]))
+    lines = ["| # | Anglais | Glossaire métier (recommandé) | Standard | Variantes standard |",
+             "|---|---|---|---|---|"]
+    lines += [f"| {i} | {md_cell(e)} | {md_cell(c)} | {md_cell(s)} | {md_cell(v)} |"
+              for i, (e, c, s, v) in enumerate(rows, 1)]
+    sys.stdout.buffer.write(("\n".join(lines) + "\n").encode("utf-8"))
+    print(f"{len(rows)} conflict(s)", file=sys.stderr)
+
+
 def xml_escape(value):
     return value.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -244,6 +554,39 @@ def cmd_apply(args):
 def main():
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = p.add_subparsers(dest="cmd", required=True)
+
+    v = sub.add_parser("versions")
+    v.add_argument("--repo", default=".", help="folder inside the repository (default: current folder)")
+    v.set_defaults(func=cmd_versions)
+
+    ss = sub.add_parser("std-status")
+    ss.add_argument("dir", help="folder holding the xlf files (Translations)")
+    ss.add_argument("--lang", default="fr-FR")
+    ss.add_argument("--alpackages")
+    ss.set_defaults(func=cmd_std_status)
+
+    sb = sub.add_parser("std-build")
+    sb.add_argument("dir", help="folder holding the xlf files (Translations)")
+    sb.add_argument("--lang", default="fr-FR")
+    sb.add_argument("--alpackages")
+    sb.add_argument("--limit-base", type=int, default=400, help="terms kept for the Base Application")
+    sb.add_argument("--limit", type=int, default=150, help="terms kept for each other dependency")
+    sb.add_argument("--max-words", type=int, default=3)
+    sb.set_defaults(func=cmd_std_build)
+
+    sl = sub.add_parser("std-lookup")
+    sl.add_argument("dir", help="folder holding the xlf files (Translations)")
+    sl.add_argument("term")
+    sl.add_argument("--lang", default="fr-FR")
+    sl.add_argument("--alpackages")
+    sl.add_argument("--app", help="search only this dependency (e.g. \"Base Application\")")
+    sl.add_argument("--limit", type=int, default=20)
+    sl.set_defaults(func=cmd_std_lookup)
+
+    sc = sub.add_parser("std-conflicts")
+    sc.add_argument("glossary", help="extension glossary (glossary.<lang>.md)")
+    sc.add_argument("std", help="standard glossary (glossary.std.<lang>.md)")
+    sc.set_defaults(func=cmd_std_conflicts)
 
     e = sub.add_parser("extract")
     e.add_argument("file")
